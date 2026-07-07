@@ -1,0 +1,42 @@
+[package]
+name    = "gguf-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gguf-info"
+path = "src/bin/gguf-info.rs"
+
+[[bin]]
+name = "generate"
+path = "src/bin/generate.rs"
+
+[features]
+default = ["cpu"]
+cpu   = ["cubecl/cpu"]
+hip   = ["cubecl/hip"]
+cuda  = ["cubecl/cuda"]
+wgpu  = ["cubecl/wgpu"]
+metal = ["cubecl/metal"]
+
+[dependencies]
+# Core
+memmap2   = "0.9"
+half      = "2.4"
+bytemuck  = "1.21"
+sysinfo   = "0.33"
+
+# GPU compute — one kernel set, all backends
+cubecl    = { version = "0.10", default-features = false, features = ["std", "stdlib"] }
+cubecl-wgpu = { version = "0.10", optional = true, default-features = false, features = ["msl"] }
+
+# Parallelism — data-parallel matmul over output rows
+rayon     = "1.8"
+
+# Error handling
+thiserror = "2.0"
+anyhow    = "1.0"
+
+# CLI
+clap      = { version = "4.5", features = ["derive"] }
+wide = "1.5.0"
