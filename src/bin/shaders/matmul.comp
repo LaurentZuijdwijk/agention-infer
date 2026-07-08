@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { float w[]; };
+layout(set = 0, binding = 1) readonly buffer InputBuf { float x[]; };
+layout(set = 0, binding = 2) buffer OutputBuf { float out_[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint in_dim;
+    uint out_dim;
+} pc;
+
+shared float partial_sum[64];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.out_dim) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint i = lane;
+    while (i < pc.in_dim) {
+        sum += w[row * pc.in_dim + i] * x[i];
+        i += 64u;
+    }
+    partial_sum[lane] = sum;
+    barrier();
+
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            partial_sum[lane] += partial_sum[lane + s];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        out_[row] = partial_sum[0];
+    }
+}

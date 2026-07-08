@@ -437,6 +437,11 @@ impl KvCache {
         debug_assert!(layer < self.n_layers);
         (&self.k[layer][..=pos], &self.v[layer][..=pos])
     }
+
+    /// Maximum sequence length this cache was allocated for.
+    pub fn max_seq_len(&self) -> usize {
+        self.k.first().map_or(0, |l| l.len())
+    }
 }
 
 /// Create a model from a GGUF file.

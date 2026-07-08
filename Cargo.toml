@@ -11,6 +11,11 @@ path = "src/bin/gguf-info.rs"
 name = "generate"
 path = "src/bin/generate.rs"
 
+[[bin]]
+name = "vulkan_poc"
+path = "src/bin/vulkan_poc.rs"
+required-features = ["vulkan-poc"]
+
 [features]
 default = ["cpu"]
 cpu   = ["cubecl/cpu"]
@@ -18,6 +23,10 @@ hip   = ["cubecl/hip"]
 cuda  = ["cubecl/cuda"]
 wgpu  = ["cubecl/wgpu"]
 metal = ["cubecl/metal"]
+# Standalone raw-Vulkan dispatch-overhead prototype (src/bin/vulkan_poc.rs) —
+# not part of the engine, just measuring whether bypassing wgpu's per-dispatch
+# bookkeeping actually lowers per-dispatch cost on this hardware.
+vulkan-poc = ["dep:ash"]
 
 [dependencies]
 # Core
@@ -40,3 +49,6 @@ anyhow    = "1.0"
 # CLI
 clap      = { version = "4.5", features = ["derive"] }
 wide = "1.5.0"
+
+# Raw-Vulkan dispatch-overhead prototype only (feature "vulkan-poc")
+ash = { version = "0.38", optional = true }

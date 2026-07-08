@@ -3,3 +3,6 @@ Cargo.lock
 target/
 .claude/
 /model/
+
+# Local model weights (large, gitignored)
+models/
