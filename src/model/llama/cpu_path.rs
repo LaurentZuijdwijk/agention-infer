@@ -812,6 +812,179 @@ impl<'a> LlamaModel<'a> {
 
         Ok(state.logits.clone())
     }
+
+    /// Batched CPU prefill: run `tokens` (placed at `pos_start`, `pos_start+1`,
+    /// …) through the layer stack in one pass, writing K/V for every position
+    /// and returning the logits for the **last** position only.
+    ///
+    /// The win over looping [`run`] is that the big matmuls (QKV, o-proj, FFN,
+    /// and — where present — plain attention) are computed with
+    /// [`crate::model::WeightMap::matmul_batch_into`], which dequantizes each
+    /// weight row once and reuses it across the whole batch instead of
+    /// re-reading every weight tensor once per token.
+    ///
+    /// Recurrent / gated mixers (`ShortConv`, `GatedAttention`, `GatedDeltaNet`)
+    /// are inherently sequential, so they reuse the single-token helpers one
+    /// position at a time (their persistent state is advanced in order); only
+    /// their input projection misses the batch amortization.
+    pub(crate) fn run_batch(
+        &self,
+        tokens: &[u32],
+        pos_start: usize,
+        kv_cache: &mut KvCache,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        debug_assert!(n > 0);
+
+        let e = self.cfg.embedding_length as usize;
+        let head_dim = self.cfg.head_dim as usize;
+        let q_dim = self.cfg.head_count as usize * head_dim;
+        let kv_dim = self.cfg.head_count_kv as usize * head_dim;
+        let ff = self.cfg.feed_forward_length as usize;
+        let n_heads = self.cfg.head_count as usize;
+        let n_kv_heads = self.cfg.head_count_kv as usize;
+
+        // Per-prefill batch scratch (one allocation per prefill call, not per
+        // token). The through-layer activations carry a leading batch dim.
+        let mut xb = vec![0f32; n * e]; // residual stream
+        let mut xnb = vec![0f32; n * e]; // normalized activations
+        let mut projb = vec![0f32; n * e]; // mixer / FFN output
+        let mut qb = vec![0f32; n * q_dim];
+        let mut kb = vec![0f32; n * kv_dim];
+        let mut vb = vec![0f32; n * kv_dim];
+        let mut attn_outb = vec![0f32; n * q_dim];
+        let mut gateb = vec![0f32; n * ff];
+        let mut upb = vec![0f32; n * ff];
+
+        // 1. Embedding lookup for every token → residual stream.
+        for (t, &token) in tokens.iter().enumerate() {
+            let embd = self.weights.dequant_row(&self.token_embd, token as usize)?;
+            xb[t * e..t * e + e].copy_from_slice(&embd);
+        }
+
+        // 2. Transformer layers.
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Operator prenorm (per token) → xnb.
+            for t in 0..n {
+                self.rms_norm_into(
+                    &xb[t * e..t * e + e],
+                    &layer.attn_norm,
+                    &mut xnb[t * e..t * e + e],
+                );
+            }
+
+            match &layer.mixer {
+                Mixer::Attention {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    // Batched QKV projections (dequant shared across the batch).
+                    self.weights.matmul_batch_into(wq, &xnb, &mut qb, n)?;
+                    self.weights.matmul_batch_into(wk, &xnb, &mut kb, n)?;
+                    self.weights.matmul_batch_into(wv, &xnb, &mut vb, n)?;
+
+                    // Per-position QK-norm → RoPE → cache write → attention.
+                    for t in 0..n {
+                        let pos = pos_start + t;
+                        let q = &mut qb[t * q_dim..t * q_dim + q_dim];
+                        let k = &mut kb[t * kv_dim..t * kv_dim + kv_dim];
+                        if let Some(q_norm) = q_norm {
+                            self.qk_norm(q, q_norm, n_heads)?;
+                        }
+                        if let Some(k_norm) = k_norm {
+                            self.qk_norm(k, k_norm, n_kv_heads)?;
+                        }
+                        self.rope(q, k, pos);
+
+                        let v = &vb[t * kv_dim..t * kv_dim + kv_dim];
+                        kv_cache.write(i, pos, k, v);
+                        let (k_all, v_all) = kv_cache.read_up_to(i, pos);
+                        self.attention_into(
+                            q,
+                            k_all,
+                            v_all,
+                            &mut attn_outb[t * q_dim..t * q_dim + q_dim],
+                            &mut state.scores,
+                        );
+                    }
+
+                    // Batched output projection.
+                    self.weights.matmul_batch_into(wo, &attn_outb, &mut projb, n)?;
+                }
+                Mixer::ShortConv(sc) => {
+                    // Sequential recurrent mixer: reuse the single-token helper
+                    // per position, shuttling the batched row through `state`.
+                    for t in 0..n {
+                        state.xn.copy_from_slice(&xnb[t * e..t * e + e]);
+                        self.short_conv(i, sc, state)?;
+                        projb[t * e..t * e + e].copy_from_slice(&state.proj);
+                    }
+                }
+                Mixer::GatedAttention {
+                    wqg,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    for t in 0..n {
+                        state.xn.copy_from_slice(&xnb[t * e..t * e + e]);
+                        self.gated_attention(
+                            i, wqg, wk, wv, wo, q_norm, k_norm, pos_start + t, kv_cache, state,
+                        )?;
+                        projb[t * e..t * e + e].copy_from_slice(&state.proj);
+                    }
+                }
+                Mixer::GatedDeltaNet(gdn) => {
+                    let dims = self
+                        .gdn_dims
+                        .expect("gdn_dims must be set when a GatedDeltaNet layer exists");
+                    for t in 0..n {
+                        state.xn.copy_from_slice(&xnb[t * e..t * e + e]);
+                        self.gated_delta_net(i, gdn, &dims, state)?;
+                        projb[t * e..t * e + e].copy_from_slice(&state.proj);
+                    }
+                }
+            }
+
+            // Mixer residual.
+            for j in 0..n * e {
+                xb[j] += projb[j];
+            }
+
+            // FFN (SwiGLU): prenorm → batched gate/up → silu-combine → down.
+            for t in 0..n {
+                self.rms_norm_into(
+                    &xb[t * e..t * e + e],
+                    &layer.ffn_norm,
+                    &mut xnb[t * e..t * e + e],
+                );
+            }
+            self.weights.matmul_batch_into(&layer.ffn_gate, &xnb, &mut gateb, n)?;
+            self.weights.matmul_batch_into(&layer.ffn_up, &xnb, &mut upb, n)?;
+            for (g, &u) in gateb.iter_mut().zip(upb.iter()) {
+                let silu = *g / (1.0 + (-*g).exp());
+                *g = silu * u;
+            }
+            self.weights.matmul_batch_into(&layer.ffn_down, &gateb, &mut projb, n)?;
+
+            for j in 0..n * e {
+                xb[j] += projb[j];
+            }
+        }
+
+        // 3. Final norm + project to vocab — last position only.
+        let last = (n - 1) * e;
+        self.rms_norm_into(&xb[last..last + e], &self.output_norm, &mut state.xn);
+        self.matmul_into(&self.lm_head, &state.xn, &mut state.logits)?;
+        Ok(state.logits.clone())
+    }
 }
 
 /// Generic causal depthwise conv1d over `channels` channels with kernel width

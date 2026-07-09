@@ -166,16 +166,10 @@ fn main() -> Result<()> {
     // ── Prefill ─────────────────────────────────────────────────────────
     trace!("prefill: {} tokens...", prompt_ids.len());
     let prefill_start = Instant::now();
-    let mut pos = 0usize;
-    let mut logits = Vec::new();
-    for &tok in &prompt_ids {
-        let t0 = Instant::now();
-        logits = model.forward(tok, pos, &mut kv)?;
-        if args.verbose {
-            trace!("  prefill tok {pos}: {:.3}s", t0.elapsed().as_secs_f32());
-        }
-        pos += 1;
-    }
+    // One batched pass over the whole prompt (one weight read per layer),
+    // rather than a `forward` per token.
+    let mut logits = model.forward_batch(&prompt_ids, 0, &mut kv)?;
+    let mut pos = prompt_ids.len();
     let prefill_time = prefill_start.elapsed();
     trace!("prefill done ({:.2}s)", prefill_time.as_secs_f32());
 

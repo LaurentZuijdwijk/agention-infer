@@ -76,13 +76,11 @@ pub fn greedy_run(
     );
 
     // ── Prefill ──────────────────────────────────────────────────────────
-    let mut pos = 0usize;
-    let mut logits = Vec::new();
+    // One batched pass over the whole prompt (one weight read per layer),
+    // rather than a `forward` per token.
     let t_prefill = Instant::now();
-    for &tok in &prompt_ids {
-        logits = model.forward(tok, pos, &mut kv)?;
-        pos += 1;
-    }
+    let mut logits = model.forward_batch(&prompt_ids, 0, &mut kv)?;
+    let mut pos = prompt_ids.len();
     let prefill = t_prefill.elapsed();
 
     // ── Greedy decode ────────────────────────────────────────────────────

@@ -373,6 +373,67 @@ impl<'a> WeightMap<'a> {
                 Ok(())
             })
     }
+
+    /// Batched fused matmul: `out[t] = W * x[t]` for each of `batch` input rows.
+    ///
+    /// Each weight row is dequantized **once** and dotted against all `batch`
+    /// input rows — amortizing the dequant that the per-token [`matmul_into`]
+    /// pays `batch` times. This is the batched-prefill win: one weight read per
+    /// layer instead of one per prompt token.
+    ///
+    /// `x` is `[batch * in_dim]` token-major and `out` is `[batch * out_dim]`
+    /// token-major, so token `t`'s result is `out[t*out_dim ..][.. out_dim]`.
+    pub fn matmul_batch_into(
+        &self,
+        name: &str,
+        x: &[f32],
+        out: &mut [f32],
+        batch: usize,
+    ) -> Result<()> {
+        let tensor = self
+            .get(name)
+            .ok_or_else(|| GgufError::MissingMetadata(format!("tensor {name}")))?;
+
+        let out_dim: usize = if tensor.n_dims as usize == 1 {
+            1
+        } else {
+            tensor.dims[1..].iter().product::<u64>() as usize
+        };
+
+        debug_assert!(batch > 0);
+        debug_assert_eq!(x.len() % batch, 0, "matmul_batch_into: x not divisible by batch");
+        let in_dim = x.len() / batch;
+        debug_assert_eq!(
+            out.len(),
+            batch * out_dim,
+            "matmul_batch_into: output buffer len {} != {batch}*{out_dim}",
+            out.len()
+        );
+
+        let data = self.data;
+
+        // Compute output-row-major `[out_dim][batch]` in parallel across output
+        // rows (dequant shared over the batch), then transpose to token-major.
+        let mut rowmajor = vec![0f32; out_dim * batch];
+        rowmajor
+            .par_chunks_mut(batch)
+            .enumerate()
+            .try_for_each(|(r, chunk)| -> Result<()> {
+                let wr = crate::quant::dequant_row(tensor, data, r)?;
+                for (t, o) in chunk.iter_mut().enumerate() {
+                    let xt = &x[t * in_dim..t * in_dim + in_dim];
+                    *o = wr.iter().zip(xt).map(|(w, xi)| w * xi).sum();
+                }
+                Ok(())
+            })?;
+
+        for r in 0..out_dim {
+            for t in 0..batch {
+                out[t * out_dim + r] = rowmajor[r * batch + t];
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The Model trait — the core abstraction.
@@ -388,6 +449,29 @@ pub trait Model: Send + Sync {
     ///
     /// Returns the logits vector `[vocab_size]`.
     fn forward(&mut self, token: u32, pos: usize, kv_cache: &mut KvCache) -> Result<Vec<f32>>;
+
+    /// Run a forward pass for a contiguous batch of tokens (prefill).
+    ///
+    /// `tokens` are the input token IDs; the first is placed at `pos_start`,
+    /// the next at `pos_start + 1`, and so on. K/V are written for **every**
+    /// position in the batch, but only the logits for the **last** position are
+    /// returned (prefill only needs the last row to seed decoding).
+    ///
+    /// The default implementation loops [`Model::forward`] one token at a time,
+    /// so it is behaviourally identical to sequential prefill. Architectures
+    /// that can share a single weight read across the batch override this.
+    fn forward_batch(
+        &mut self,
+        tokens: &[u32],
+        pos_start: usize,
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            logits = self.forward(tok, pos_start + i, kv_cache)?;
+        }
+        Ok(logits)
+    }
 
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
@@ -429,6 +513,24 @@ impl KvCache {
         debug_assert_eq!(v.len(), self.head_dim_kv);
         self.k[layer][pos][..k.len()].copy_from_slice(k);
         self.v[layer][pos][..v.len()].copy_from_slice(v);
+    }
+
+    /// Write K and V for a contiguous range of positions starting at
+    /// `pos_start`. `k` and `v` are laid out `[n_positions * head_dim_kv]`
+    /// (position-major), i.e. position `p` occupies `[p*head_dim_kv ..
+    /// (p+1)*head_dim_kv]`. Equivalent to calling [`KvCache::write`] once per
+    /// position.
+    pub fn write_range(&mut self, layer: usize, pos_start: usize, k: &[f32], v: &[f32]) {
+        debug_assert!(layer < self.n_layers);
+        debug_assert_eq!(k.len(), v.len());
+        debug_assert_eq!(k.len() % self.head_dim_kv, 0);
+        let n = k.len() / self.head_dim_kv;
+        let stride = self.head_dim_kv;
+        for p in 0..n {
+            let src = p * stride..(p + 1) * stride;
+            self.k[layer][pos_start + p][..stride].copy_from_slice(&k[src.clone()]);
+            self.v[layer][pos_start + p][..stride].copy_from_slice(&v[src]);
+        }
     }
 
     /// Read all K and V up to (and including) `pos` for a given layer.

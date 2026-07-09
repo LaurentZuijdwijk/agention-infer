@@ -355,6 +355,52 @@ impl<'a> Model for LlamaModel<'a> {
         result
     }
 
+    fn forward_batch(
+        &mut self,
+        tokens: &[u32],
+        pos_start: usize,
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut state = self
+            .state
+            .take()
+            .expect("InferenceState missing (forward_batch is not re-entrant)");
+
+        #[cfg(feature = "wgpu")]
+        let result = if self.gpu_resident_ready().is_some() {
+            self.ensure_gpu_kv_cache(kv_cache.max_seq_len());
+            let b = self
+                .gpu_resident_ready()
+                .expect("checked Some(_) above; backend/model didn't change in between");
+            // Stage 3 will batch these dispatches; for now a correct
+            // per-position loop keeps the GPU path identical to sequential
+            // prefill while the CPU path gets true batching.
+            let mut logits = Vec::new();
+            let mut outcome = Ok(());
+            for (i, &tok) in tokens.iter().enumerate() {
+                match self.run_gpu_resident(b, tok, pos_start + i) {
+                    Ok(l) => logits = l,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+            }
+            outcome.map(|()| logits)
+        } else {
+            self.run_batch(tokens, pos_start, kv_cache, &mut state)
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let result = self.run_batch(tokens, pos_start, kv_cache, &mut state);
+
+        self.state = Some(state);
+        result
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.cfg
     }
