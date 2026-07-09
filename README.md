@@ -2,6 +2,14 @@
 
 An inference engine for GGUF language models, built for AMD unified memory APUs.
 
+## Start here
+
+**[roadmap/00-parity-roadmap.md](roadmap/00-parity-roadmap.md)** is the current, authoritative
+plan — llama.cpp parity on Strix Halo — with agent-executable per-phase docs in
+[roadmap/](roadmap/). It supersedes `10-build-roadmap.md`. The `01–11` design docs
+below remain useful reference, but several are annotated as out of date at the top where the tree has
+diverged; trust the code and the roadmap over them where they disagree.
+
 ## Documents
 
 | # | File | Contents |
@@ -15,7 +23,7 @@ An inference engine for GGUF language models, built for AMD unified memory APUs.
 | 07 | [turbo-quant-kv-cache.md](07-turbo-quant-kv-cache.md) | TurboQuant, WHT, Lloyd-Max, memory budget math |
 | 08 | [moe-routing.md](08-moe-routing.md) | MoE architectures, tracing, visualization, expert analysis |
 | 09 | [speedup-multimodel.md](09-speedup-multimodel.md) | Speculative decoding, prefix caching, routing, Self-MoA |
-| 10 | [build-roadmap.md](10-build-roadmap.md) | Phase-by-phase checklist, milestones, test strategy |
+| 10 | [build-roadmap.md](10-build-roadmap.md) | ⚠️ superseded → see [roadmap/](roadmap/) |
 | 11 | [testing.md](11-testing.md) | Test tiers, unit/integration/golden tests, CI, debug assertions |
 
 ## Quick Reference

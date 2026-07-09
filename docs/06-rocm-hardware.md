@@ -1,5 +1,12 @@
 # ROCm & Hardware Optimization
 
+> ℹ️ **Reality note:** the working GPU path today is **wgpu/Vulkan** (via `cubecl-wgpu`), **not**
+> native ROCm/HIP — `Hip`/`Cuda` backends are currently stubbed and fall back to CPU
+> (`src/ops/backend_select.rs`). Whether to bring up native `cubecl-hip` is decided by a measured
+> matmul A/B in [Phase 2](roadmap/phase-2-gpu-performance.md); recommendation is Vulkan-primary. The
+> hardware specs, bandwidth-ceiling math, wave32 discussion, and expert-locality notes below remain
+> valid reference material.
+
 ## Target Hardware: AMD Strix Halo
 
 ### Specifications

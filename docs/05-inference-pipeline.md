@@ -1,5 +1,10 @@
 # Inference Pipeline
 
+> ⚠️ **Partly out of date.** Some described mechanics (batched flash attention, MoE, TurboQuant KV,
+> f16) are not yet implemented — the engine currently does single-token f32 forward with a naive
+> attention path and an f32 KV cache. See [`docs/roadmap/`](roadmap/) for what's actually built and
+> what's planned. Trust the code over this file where they disagree.
+
 ## The Six Core Operations
 
 Every transformer forward pass is composed of exactly these six operations. All other complexity is sequencing and data routing.

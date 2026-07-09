@@ -1,5 +1,11 @@
 # Architecture
 
+> ⚠️ **Partly aspirational / out of date.** This document describes an intended design; parts of it
+> do not match the tree (e.g. the crate layout lists files like `attention.rs`, `kv_cache.rs`,
+> `moe.rs`, `engine.rs` that don't exist; the compute stack is hand-written **wgpu/WGSL + CPU**, not
+> the pure-CubeCL-ROCm path described; ROCm/HIP is stubbed to CPU fallback). Trust the code and
+> [`docs/roadmap/`](roadmap/) over this file. Kept for design intent; a full rewrite is deferred.
+
 ## Guiding Principles
 
 **Parsing is pure.** The GGUF parser takes `&[u8]` and returns a typed data structure. No I/O inside the parser. Fully testable without touching disk.

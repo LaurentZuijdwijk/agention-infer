@@ -1,5 +1,11 @@
 # Testing Strategy
 
+> ⚠️ **Aspirational — most of this does not exist yet.** The test files, fixtures, numpy reference
+> generators, golden-vs-llama.cpp suite, benches, and CI described below are largely unbuilt; today
+> there are quant round-trip + unit tests and a manual `compare_backends` binary only. Standing up
+> this infrastructure for real is **Phase 0** — see
+> [`docs/roadmap/phase-0-correctness-harness.md`](roadmap/phase-0-correctness-harness.md).
+
 ## Philosophy
 
 **llama.cpp is the oracle, not the codebase.**
