@@ -1,0 +1,8 @@
+# model: Qwen3-1.7B-Q8_0.gguf
+# prompt_id: days
+# prompt: The days of the week are Monday, Tuesday, Wednesday,
+# n_predict: 16
+# tool: llama-simple
+# llama_build: 08e025c06
+
+ Thursday, Friday, Saturday, and Sunday. The first day of the year is

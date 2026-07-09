@@ -1,0 +1,8 @@
+# model: Qwen3.5-9B-Q4_K_M.gguf
+# prompt_id: alpha
+# prompt: a b c d e f g
+# n_predict: 16
+# tool: llama-simple
+# llama_build: 08e025c06
+
+ h i j k l m n o p q r s t u v w

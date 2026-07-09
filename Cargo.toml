@@ -12,6 +12,10 @@ name = "generate"
 path = "src/bin/generate.rs"
 
 [[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
 name = "vulkan_poc"
 path = "src/bin/vulkan_poc.rs"
 required-features = ["vulkan-poc"]

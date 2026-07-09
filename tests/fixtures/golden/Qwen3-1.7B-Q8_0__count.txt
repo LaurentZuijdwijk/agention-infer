@@ -1,0 +1,8 @@
+# model: Qwen3-1.7B-Q8_0.gguf
+# prompt_id: count
+# prompt: Here is a list of numbers: 1, 2, 3,
+# n_predict: 16
+# tool: llama-simple
+# llama_build: 08e025c06
+
+ 4, 5, 6, 7, 8, 

@@ -1,0 +1,10 @@
+# model: LFM2.5-1.2B-Instruct-Q6_K.gguf
+# prompt_id: evens
+# prompt: 2, 4, 6, 8, 10,
+# n_predict: 16
+# tool: llama-simple
+# llama_build: 08e025c06
+
+ 12, 14, 16, 18, 20
+
+What

@@ -1,6 +1,39 @@
 # Phase 0 — Correctness harness + benchmark + YaRN fix
 
-**Status:** committed (build first). See [00-parity-roadmap.md](00-parity-roadmap.md) for context.
+**Status:** ✅ done (2026-07-09). See [00-parity-roadmap.md](00-parity-roadmap.md) for context.
+
+## Outcome
+
+- **Golden gate (0.1/0.2):** `tests/golden.rs` + `scripts/gen_golden.sh` (fixtures from llama.cpp
+  `llama-simple`, raw greedy). 16 fixtures (4 models × 4 prompts) match llama.cpp **token-for-token
+  on both CPU and wgpu** — which also gives CPU↔GPU parity transitively. A shared library runner
+  (`src/runner.rs`) backs both the tests and the bench. Model tests self-skip when `models/` is
+  absent, so `cargo test` stays green in CI.
+  - **Design note:** golden prompts must be *confident* (clear top-logit margin). Open-ended prompts
+    (e.g. "The capital of France is") diverge from llama.cpp at near-tie branches after ~15 tokens —
+    e.g. Qwen3-1.7B merely reorders "UK/US" in a list, a legitimate coin-flip, not a bug. The
+    "count/days/alpha/evens" prompts match exactly on all 4 models, confirming the core math
+    (including the Qwen3.5 GatedDeltaNet hybrid and LFM2 ShortConv paths) is correct vs the oracle.
+    Keep `GOLDEN_REPORT=1 cargo test --test golden -- --nocapture` for the non-failing survey.
+- **Bench (0.3):** `src/bin/bench.rs` + `docs/roadmap/baselines.md`. Baseline recorded:
+  **9.6 tok/s decode, Qwen3.5-9B Q4_K_M / wgpu** (21% of the dense-proxy ceiling). Prefill ≈ decode
+  everywhere — the no-batching problem Phase 1 targets.
+- **RoPE/YaRN (0.4):** none of the 4 checked-in models declare `rope.scaling.type` (they use a high
+  `rope_freq_base`), so this was a *latent* bug. Centralized `compute_rope_freq_scale` now applies
+  **linear** scaling and, for **YaRN/unsupported** schemes, returns `None` so the CPU rope path
+  **warns once** instead of silently producing wrong positions. Unit-tested. Two follow-ups, both
+  unexercised today so deferred: (a) full YaRN needs extra metadata (`original_context_length`,
+  `beta_fast/slow`, `attn_factor`) parsed into `ModelConfig` and a checked-in YaRN model to golden
+  against; (b) the GPU rope kernels (`launch_rope`/`launch_qk_norm_rope`, `gpu_resident.rs`) don't
+  thread `freq_scale` yet — fine while all models are `none`, must be wired before shipping a scaled
+  model on GPU.
+- **CI (0.5):** `.github/workflows/ci.yml` — build + fast-tier test as hard gates; clippy/rustfmt
+  informational. Promote clippy to `-D warnings` after a tree-wide lint cleanup (~30 pre-existing
+  mechanical lints; the golden gate now makes that cleanup safe to verify).
+
+Original task detail below.
+
+---
 
 ## Goal
 

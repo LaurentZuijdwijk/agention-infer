@@ -4,6 +4,7 @@ pub mod model;
 pub mod ops;
 pub mod parser;
 pub mod quant;
+pub mod runner;
 pub mod sampler;
 pub mod tokenizer;
 pub mod types;

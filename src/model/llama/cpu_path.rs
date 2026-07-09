@@ -12,7 +12,56 @@ use crate::model::KvCache;
 use crate::ops::AnyBackend;
 use rayon::prelude::*;
 
+use std::sync::Once;
+
+/// Warns at most once per process when a RoPE scaling scheme we don't yet apply
+/// is encountered, so the failure is loud rather than silent.
+static WARN_UNSUPPORTED_ROPE: Once = Once::new();
+
+/// RoPE frequency multiplier implied by the model's scaling config (pure, so
+/// it is unit-testable without a model).
+///
+/// - `none` (or absent): `1.0` — frequencies unscaled.
+/// - `linear` (a.k.a. position interpolation): `1/factor` — divides the
+///   effective position, extending context proportionally.
+/// - anything else (e.g. `yarn`): `None`, signalling "not applied yet". The
+///   caller warns and falls back to `1.0`. See
+///   `docs/roadmap/phase-0-correctness-harness.md`.
+///
+/// None of the currently supported checked-in models use scaling (they rely on
+/// a high `rope_freq_base`), so this is a forward-looking guard; the golden
+/// suite confirms these models are unaffected (`freq_scale == 1.0`).
+pub(crate) fn compute_rope_freq_scale(scaling_type: Option<&str>, factor: Option<f32>) -> Option<f32> {
+    match scaling_type {
+        None | Some("") | Some("none") => Some(1.0),
+        Some("linear") => Some(1.0 / factor.unwrap_or(1.0).max(1e-6)),
+        Some(_) => None,
+    }
+}
+
 impl<'a> LlamaModel<'a> {
+    /// Effective RoPE frequency scale for this model, warning once if the
+    /// configured scaling scheme isn't applied yet.
+    fn rope_freq_scale(&self) -> f32 {
+        match compute_rope_freq_scale(
+            self.cfg.rope_scaling_type.as_deref(),
+            self.cfg.rope_scaling_factor,
+        ) {
+            Some(scale) => scale,
+            None => {
+                let ty = self.cfg.rope_scaling_type.clone();
+                WARN_UNSUPPORTED_ROPE.call_once(|| {
+                    eprintln!(
+                        "warning: RoPE scaling type {ty:?} is not yet applied (positions left \
+                         unscaled); long-context accuracy may suffer. See \
+                         docs/roadmap/phase-0-correctness-harness.md"
+                    );
+                });
+                1.0
+            }
+        }
+    }
+
     /// RMS normalization into a caller-provided buffer using a cached weight vector.
     /// `out[i] = (x[i] / rms) * weight[i]`.
     fn rms_norm_into(&self, x: &[f32], weight: &[f32], out: &mut [f32]) {
@@ -53,10 +102,11 @@ impl<'a> LlamaModel<'a> {
         let n_kv_heads = self.cfg.head_count_kv as usize;
         let theta = self.cfg.rope_freq_base;
         let half = head_dim / 2;
+        let freq_scale = self.rope_freq_scale();
 
         let table: Vec<(f32, f32)> = (0..half)
             .map(|d| {
-                let freq = pos as f32 / theta.powf(2.0 * d as f32 / head_dim as f32);
+                let freq = pos as f32 * freq_scale / theta.powf(2.0 * d as f32 / head_dim as f32);
                 freq.sin_cos()
             })
             .collect();
@@ -411,10 +461,11 @@ impl<'a> LlamaModel<'a> {
         let theta = self.cfg.rope_freq_base;
         let n_rot = self.n_rot;
         let half = n_rot / 2;
+        let freq_scale = self.rope_freq_scale();
 
         let table: Vec<(f32, f32)> = (0..half)
             .map(|d| {
-                let freq = pos as f32 / theta.powf(2.0 * d as f32 / n_rot as f32);
+                let freq = pos as f32 * freq_scale / theta.powf(2.0 * d as f32 / n_rot as f32);
                 freq.sin_cos()
             })
             .collect();
@@ -800,5 +851,33 @@ fn causal_depthwise_conv(
     if kernel >= 2 {
         let last = (kernel - 2) * channels;
         history[last..last + channels].copy_from_slice(&input[..channels]);
+    }
+}
+
+#[cfg(test)]
+mod rope_scaling_tests {
+    use super::compute_rope_freq_scale as scale;
+
+    #[test]
+    fn none_or_absent_is_identity() {
+        assert_eq!(scale(None, None), Some(1.0));
+        assert_eq!(scale(Some("none"), Some(8.0)), Some(1.0));
+        assert_eq!(scale(Some(""), Some(8.0)), Some(1.0));
+    }
+
+    #[test]
+    fn linear_divides_by_factor() {
+        assert_eq!(scale(Some("linear"), Some(4.0)), Some(0.25));
+        assert_eq!(scale(Some("linear"), Some(2.0)), Some(0.5));
+        // Missing factor is treated as 1.0 (no scaling), not a divide-by-zero.
+        assert_eq!(scale(Some("linear"), None), Some(1.0));
+    }
+
+    #[test]
+    fn unsupported_scheme_signals_deferred() {
+        // YaRN (and any future per-dimension scheme) isn't applied yet: the
+        // helper returns None so the caller can warn instead of silently
+        // producing wrong long-context positions.
+        assert_eq!(scale(Some("yarn"), Some(4.0)), None);
     }
 }

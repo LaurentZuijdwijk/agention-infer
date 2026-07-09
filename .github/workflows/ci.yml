@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + test (fast tier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default features = cpu. The wgpu backend needs a GPU/Vulkan and is not
+      # exercised in CI. Golden/model tests self-skip when models/ is absent, so
+      # this stays fast and green without the (multi-GB) checked-in models.
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Test (fast tier — no models, golden self-skips)
+        run: cargo test --locked --verbose
+
+      # Informational for now: the tree still carries pre-existing lints. Once
+      # cleaned, promote this to `-D warnings` (the golden gate makes a cleanup
+      # safe to verify). Tracked in docs/roadmap/phase-0-correctness-harness.md.
+      - name: Clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+      - name: Rustfmt check (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --check

@@ -1,0 +1,8 @@
+# model: LFM2.5-1.2B-Instruct-Q4_K_M.gguf
+# prompt_id: days
+# prompt: The days of the week are Monday, Tuesday, Wednesday,
+# n_predict: 16
+# tool: llama-simple
+# llama_build: 08e025c06
+
+ Thursday, Friday, Saturday, and Sunday. The week is a seven-day cycle
