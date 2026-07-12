@@ -7,6 +7,12 @@
 
 use cubecl::prelude::*;
 
+/// Activation storage element for the resident path (`f16` by default, `f32`
+/// with the `f32-activations` opt-out). Reductions inside these kernels always
+/// accumulate in `f32` — reads are `f32::cast_from`'d and results
+/// `Act::cast_from`'d on write, so narrowing the storage never narrows the math.
+use crate::ops::Act;
+
 // ── SwiGLU combine: out[i] = silu(gate[i]) * up[i] ────────────────────────
 //
 // Elementwise — no quantization involved, so this reads `gate`/`up` straight
@@ -14,14 +20,14 @@ use cubecl::prelude::*;
 // with no CPU round-trip in between.
 
 #[cube(launch)]
-pub fn silu_mul(gate: &Array<f32>, up: &Array<f32>, out: &mut Array<f32>) {
+pub fn silu_mul(gate: &Array<Act>, up: &Array<Act>, out: &mut Array<Act>) {
     let i = ABSOLUTE_POS;
     if i >= out.len() {
         terminate!();
     }
-    let g = gate[i];
+    let g = f32::cast_from(gate[i]);
     let silu = g / (1.0f32 + (-g).exp());
-    out[i] = silu * up[i];
+    out[i] = Act::cast_from(silu * f32::cast_from(up[i]));
 }
 
 // ── Sigmoid gate: out[i] = a[i] * sigmoid(b[i]) ───────────────────────────
@@ -31,12 +37,13 @@ pub fn silu_mul(gate: &Array<f32>, up: &Array<f32>, out: &mut Array<f32>) {
 // sigmoid(gate) * up`) — this has no extra `gate` factor.
 
 #[cube(launch)]
-pub fn sigmoid_mul(a: &Array<f32>, b: &Array<f32>, out: &mut Array<f32>) {
+pub fn sigmoid_mul(a: &Array<Act>, b: &Array<Act>, out: &mut Array<Act>) {
     let i = ABSOLUTE_POS;
     if i >= out.len() {
         terminate!();
     }
-    out[i] = a[i] / (1.0f32 + (-b[i]).exp());
+    let bi = f32::cast_from(b[i]);
+    out[i] = Act::cast_from(f32::cast_from(a[i]) / (1.0f32 + (-bi).exp()));
 }
 
 // ── Split fused Q+gate projection ──────────────────────────────────────────
@@ -47,7 +54,7 @@ pub fn sigmoid_mul(a: &Array<f32>, b: &Array<f32>, out: &mut Array<f32>) {
 // contiguous `q`/`gate` buffers.
 
 #[cube(launch)]
-pub fn split_qg(qg_raw: &Array<f32>, q: &mut Array<f32>, gate: &mut Array<f32>, head_dim: usize) {
+pub fn split_qg(qg_raw: &Array<Act>, q: &mut Array<Act>, gate: &mut Array<Act>, head_dim: usize) {
     let idx = ABSOLUTE_POS;
     let n_heads = q.len() / head_dim;
     if idx >= n_heads * head_dim {
@@ -68,7 +75,7 @@ pub fn split_qg(qg_raw: &Array<f32>, q: &mut Array<f32>, gate: &mut Array<f32>, 
 // reduction would add complexity without a measurable win.
 
 #[cube(launch)]
-pub fn rms_norm(x: &Array<f32>, weight: &Array<f32>, out: &mut Array<f32>, eps: f32) {
+pub fn rms_norm(x: &Array<Act>, weight: &Array<f32>, out: &mut Array<Act>, eps: f32) {
     if ABSOLUTE_POS != 0 {
         terminate!();
     }
@@ -76,14 +83,14 @@ pub fn rms_norm(x: &Array<f32>, weight: &Array<f32>, out: &mut Array<f32>, eps: 
     let mut sum_sq = 0.0f32;
     let mut i = 0usize;
     while i < n {
-        let xi = x[i];
+        let xi = f32::cast_from(x[i]);
         sum_sq += xi * xi;
         i += 1;
     }
     let rms = f32::sqrt(sum_sq / (n as f32) + eps);
     let mut j = 0usize;
     while j < n {
-        out[j] = (x[j] / rms) * weight[j];
+        out[j] = Act::cast_from((f32::cast_from(x[j]) / rms) * weight[j]);
         j += 1;
     }
 }
@@ -97,11 +104,11 @@ pub fn rms_norm(x: &Array<f32>, weight: &Array<f32>, out: &mut Array<f32>, eps: 
 
 #[cube(launch)]
 pub fn add_residual_rms_norm(
-    x: &Array<f32>,
-    delta: &Array<f32>,
+    x: &Array<Act>,
+    delta: &Array<Act>,
     weight: &Array<f32>,
-    new_x: &mut Array<f32>,
-    normed: &mut Array<f32>,
+    new_x: &mut Array<Act>,
+    normed: &mut Array<Act>,
     eps: f32,
 ) {
     if ABSOLUTE_POS != 0 {
@@ -111,15 +118,15 @@ pub fn add_residual_rms_norm(
     let mut sum_sq = 0.0f32;
     let mut i = 0usize;
     while i < n {
-        let v = x[i] + delta[i];
-        new_x[i] = v;
+        let v = f32::cast_from(x[i]) + f32::cast_from(delta[i]);
+        new_x[i] = Act::cast_from(v);
         sum_sq += v * v;
         i += 1;
     }
     let rms = f32::sqrt(sum_sq / (n as f32) + eps);
     let mut j = 0usize;
     while j < n {
-        normed[j] = (new_x[j] / rms) * weight[j];
+        normed[j] = Act::cast_from((f32::cast_from(new_x[j]) / rms) * weight[j]);
         j += 1;
     }
 }
@@ -136,10 +143,10 @@ pub fn add_residual_rms_norm(
 
 #[cube(launch)]
 pub fn short_conv(
-    bcx: &Array<f32>,
+    bcx: &Array<Act>,
     weight: &Array<f32>,
     history: &mut Array<f32>,
-    conv_out: &mut Array<f32>,
+    conv_out: &mut Array<Act>,
     l: usize,
 ) {
     let ch = ABSOLUTE_POS;
@@ -149,9 +156,9 @@ pub fn short_conv(
     }
 
     // bcx = concat(B, C, x_gate), each length d.
-    let b = bcx[ch];
-    let c = bcx[d + ch];
-    let xg = bcx[2 * d + ch];
+    let b = f32::cast_from(bcx[ch]);
+    let c = f32::cast_from(bcx[d + ch]);
+    let xg = f32::cast_from(bcx[2 * d + ch]);
     let bx = b * xg;
 
     let tap_base = ch * l;
@@ -162,7 +169,7 @@ pub fn short_conv(
         k += 1;
     }
     acc += weight[tap_base + l - 1] * bx;
-    conv_out[ch] = c * acc;
+    conv_out[ch] = Act::cast_from(c * acc);
 
     // Shift history left by one slot (drop oldest), append `bx` as newest.
     if l >= 2 {
@@ -185,7 +192,7 @@ pub fn short_conv(
 // head_dim` for full rotation).
 
 #[cube(launch)]
-pub fn rope(x: &mut Array<f32>, n_heads: usize, head_dim: usize, n_rot: usize, pos: usize, theta: f32) {
+pub fn rope(x: &mut Array<Act>, n_heads: usize, head_dim: usize, n_rot: usize, pos: usize, theta: f32) {
     let half = n_rot / 2;
     let idx = ABSOLUTE_POS;
     if idx >= n_heads * half {
@@ -200,10 +207,10 @@ pub fn rope(x: &mut Array<f32>, n_heads: usize, head_dim: usize, n_rot: usize, p
     let cos_val = freq.cos();
     let sin_val = freq.sin();
 
-    let x0 = x[start + d];
-    let x1 = x[start + d + half];
-    x[start + d] = x0 * cos_val - x1 * sin_val;
-    x[start + d + half] = x0 * sin_val + x1 * cos_val;
+    let x0 = f32::cast_from(x[start + d]);
+    let x1 = f32::cast_from(x[start + d + half]);
+    x[start + d] = Act::cast_from(x0 * cos_val - x1 * sin_val);
+    x[start + d + half] = Act::cast_from(x0 * sin_val + x1 * cos_val);
 }
 
 // ── Fused QK-norm + RoPE: one thread per head does the RMSNorm reduction ──
@@ -213,7 +220,7 @@ pub fn rope(x: &mut Array<f32>, n_heads: usize, head_dim: usize, n_rot: usize, p
 
 #[cube(launch)]
 pub fn qk_norm_rope(
-    x: &mut Array<f32>,
+    x: &mut Array<Act>,
     weight: &Array<f32>,
     n_heads: usize,
     head_dim: usize,
@@ -231,7 +238,7 @@ pub fn qk_norm_rope(
     let mut sum_sq = 0.0f32;
     let mut d = 0usize;
     while d < head_dim {
-        let v = x[start + d];
+        let v = f32::cast_from(x[start + d]);
         sum_sq += v * v;
         d += 1;
     }
@@ -239,7 +246,7 @@ pub fn qk_norm_rope(
 
     let mut d2 = 0usize;
     while d2 < head_dim {
-        x[start + d2] = weight[d2] * x[start + d2] / rms;
+        x[start + d2] = Act::cast_from(weight[d2] * f32::cast_from(x[start + d2]) / rms);
         d2 += 1;
     }
 
@@ -250,10 +257,10 @@ pub fn qk_norm_rope(
         let freq = (pos as f32) / f32::powf(theta, exponent);
         let cos_val = freq.cos();
         let sin_val = freq.sin();
-        let x0 = x[start + d3];
-        let x1 = x[start + d3 + half];
-        x[start + d3] = x0 * cos_val - x1 * sin_val;
-        x[start + d3 + half] = x0 * sin_val + x1 * cos_val;
+        let x0 = f32::cast_from(x[start + d3]);
+        let x1 = f32::cast_from(x[start + d3 + half]);
+        x[start + d3] = Act::cast_from(x0 * cos_val - x1 * sin_val);
+        x[start + d3 + half] = Act::cast_from(x0 * sin_val + x1 * cos_val);
         d3 += 1;
     }
 }
@@ -268,7 +275,7 @@ pub fn qk_norm_rope(
 
 #[cube(launch)]
 pub fn l2_norm_heads(
-    x: &mut Array<f32>,
+    x: &mut Array<Act>,
     base_offset: usize,
     base_offset2: usize,
     n_heads: usize,
@@ -286,7 +293,7 @@ pub fn l2_norm_heads(
     let mut sum_sq = 0.0f32;
     let mut d = 0usize;
     while d < head_dim {
-        let v = x[start + d];
+        let v = f32::cast_from(x[start + d]);
         sum_sq += v * v;
         d += 1;
     }
@@ -294,7 +301,7 @@ pub fn l2_norm_heads(
 
     let mut d2 = 0usize;
     while d2 < head_dim {
-        x[start + d2] = x[start + d2] / norm;
+        x[start + d2] = Act::cast_from(f32::cast_from(x[start + d2]) / norm);
         d2 += 1;
     }
 }
@@ -306,9 +313,9 @@ pub fn l2_norm_heads(
 
 #[cube(launch)]
 pub fn gdn_gated_rms_norm(
-    x: &mut Array<f32>,
+    x: &mut Array<Act>,
     weight: &Array<f32>,
-    gate: &Array<f32>,
+    gate: &Array<Act>,
     n_heads: usize,
     head_dim: usize,
     eps: f32,
@@ -322,7 +329,7 @@ pub fn gdn_gated_rms_norm(
     let mut sum_sq = 0.0f32;
     let mut d = 0usize;
     while d < head_dim {
-        let v = x[start + d];
+        let v = f32::cast_from(x[start + d]);
         sum_sq += v * v;
         d += 1;
     }
@@ -330,10 +337,10 @@ pub fn gdn_gated_rms_norm(
 
     let mut d2 = 0usize;
     while d2 < head_dim {
-        let normed = weight[d2] * x[start + d2] / rms;
-        let g = gate[start + d2];
+        let normed = weight[d2] * f32::cast_from(x[start + d2]) / rms;
+        let g = f32::cast_from(gate[start + d2]);
         let silu = g / (1.0f32 + (-g).exp());
-        x[start + d2] = normed * silu;
+        x[start + d2] = Act::cast_from(normed * silu);
         d2 += 1;
     }
 }
@@ -343,8 +350,8 @@ pub fn gdn_gated_rms_norm(
 
 #[cube(launch)]
 pub fn gdn_gate_decay(
-    beta_raw: &mut Array<f32>,
-    alpha_raw: &mut Array<f32>,
+    beta_raw: &mut Array<Act>,
+    alpha_raw: &mut Array<Act>,
     ssm_a: &Array<f32>,
     dt_bias: &Array<f32>,
 ) {
@@ -352,12 +359,12 @@ pub fn gdn_gate_decay(
     if h >= beta_raw.len() {
         terminate!();
     }
-    let braw = beta_raw[h];
-    beta_raw[h] = 1.0f32 / (1.0f32 + (-braw).exp());
+    let braw = f32::cast_from(beta_raw[h]);
+    beta_raw[h] = Act::cast_from(1.0f32 / (1.0f32 + (-braw).exp()));
 
-    let x = alpha_raw[h] + dt_bias[h];
+    let x = f32::cast_from(alpha_raw[h]) + dt_bias[h];
     let softplus = if x > 20.0f32 { x } else { (1.0f32 + x.exp()).ln() };
-    alpha_raw[h] = (ssm_a[h] * softplus).exp();
+    alpha_raw[h] = Act::cast_from((ssm_a[h] * softplus).exp());
 }
 
 // ── Gated DeltaNet causal depthwise conv1d + SiLU ─────────────────────────
@@ -368,10 +375,10 @@ pub fn gdn_gate_decay(
 
 #[cube(launch)]
 pub fn causal_conv1d_silu(
-    input: &Array<f32>,
+    input: &Array<Act>,
     weight: &Array<f32>,
     history: &mut Array<f32>,
-    output: &mut Array<f32>,
+    output: &mut Array<Act>,
     kernel: usize,
 ) {
     let ch = ABSOLUTE_POS;
@@ -380,6 +387,7 @@ pub fn causal_conv1d_silu(
         terminate!();
     }
 
+    let in_ch = f32::cast_from(input[ch]);
     let tap_base = ch * kernel;
     let mut acc = 0.0f32;
     let mut k = 0usize;
@@ -387,8 +395,8 @@ pub fn causal_conv1d_silu(
         acc += weight[tap_base + k] * history[k * d + ch];
         k += 1;
     }
-    acc += weight[tap_base + kernel - 1] * input[ch];
-    output[ch] = acc / (1.0f32 + (-acc).exp());
+    acc += weight[tap_base + kernel - 1] * in_ch;
+    output[ch] = Act::cast_from(acc / (1.0f32 + (-acc).exp()));
 
     // Advance the recurrent history: drop the oldest slot, append current input.
     if kernel >= 2 {
@@ -397,7 +405,7 @@ pub fn causal_conv1d_silu(
             history[k2 * d + ch] = history[(k2 + 1) * d + ch];
             k2 += 1;
         }
-        history[(kernel - 2) * d + ch] = input[ch];
+        history[(kernel - 2) * d + ch] = in_ch;
     }
 }
 
@@ -414,10 +422,10 @@ pub fn causal_conv1d_silu(
 #[cube(launch)]
 pub fn gdn_recurrence(
     state: &mut Array<f32>,
-    conv_out: &Array<f32>,
-    beta: &Array<f32>,
-    decay: &Array<f32>,
-    out: &mut Array<f32>,
+    conv_out: &Array<Act>,
+    beta: &Array<Act>,
+    decay: &Array<Act>,
+    out: &mut Array<Act>,
     n_k_heads: usize,
     head_k_dim: usize,
     head_v_dim: usize,
@@ -436,21 +444,24 @@ pub fn gdn_recurrence(
     let v_h_start = 2 * key_dim + h * head_v_dim;
     let state_base = h * head_k_dim * head_v_dim;
 
-    let beta_h = beta[h];
-    let decay_h = decay[h];
+    let beta_h = f32::cast_from(beta[h]);
+    let decay_h = f32::cast_from(decay[h]);
 
+    // Persistent `state` stays f32 across tokens (accumulates over the whole
+    // sequence — narrowing it would compound drift); only the per-token
+    // `conv_out`/`out` activations are narrowed.
     let mut vpred = 0.0f32;
     let mut a = 0usize;
     while a < head_k_dim {
-        vpred += state[state_base + a * head_v_dim + b] * conv_out[k_h_start + a];
+        vpred += state[state_base + a * head_v_dim + b] * f32::cast_from(conv_out[k_h_start + a]);
         a += 1;
     }
-    let delta_b = beta_h * (conv_out[v_h_start + b] - vpred);
+    let delta_b = beta_h * (f32::cast_from(conv_out[v_h_start + b]) - vpred);
 
     let mut a2 = 0usize;
     while a2 < head_k_dim {
         let idx = state_base + a2 * head_v_dim + b;
-        let k_val = conv_out[k_h_start + a2];
+        let k_val = f32::cast_from(conv_out[k_h_start + a2]);
         state[idx] = decay_h * state[idx] + k_val * delta_b;
         a2 += 1;
     }
@@ -458,10 +469,10 @@ pub fn gdn_recurrence(
     let mut acc = 0.0f32;
     let mut a3 = 0usize;
     while a3 < head_k_dim {
-        acc += scale * conv_out[q_h_start + a3] * state[state_base + a3 * head_v_dim + b];
+        acc += scale * f32::cast_from(conv_out[q_h_start + a3]) * state[state_base + a3 * head_v_dim + b];
         a3 += 1;
     }
-    out[h * head_v_dim + b] = acc;
+    out[h * head_v_dim + b] = Act::cast_from(acc);
 }
 
 // ── KV cache write ──────────────────────────────────────────────────────
@@ -471,10 +482,10 @@ pub fn gdn_recurrence(
 
 #[cube(launch)]
 pub fn kv_cache_write(
-    k_cache: &mut Array<f32>,
-    v_cache: &mut Array<f32>,
-    new_k: &Array<f32>,
-    new_v: &Array<f32>,
+    k_cache: &mut Array<Act>,
+    v_cache: &mut Array<Act>,
+    new_k: &Array<Act>,
+    new_v: &Array<Act>,
     pos: usize,
 ) {
     let i = ABSOLUTE_POS;
@@ -517,8 +528,8 @@ pub fn kv_cache_write(
 
 #[cube(launch)]
 pub fn attention_scores(
-    q: &Array<f32>,
-    kv_cache_k: &Array<f32>,
+    q: &Array<Act>,
+    kv_cache_k: &Array<Act>,
     scores: &mut Array<f32>,
     pos: usize,
     head_dim: usize,
@@ -545,7 +556,7 @@ pub fn attention_scores(
     let mut dot = 0.0f32;
     let mut d = 0usize;
     while d < head_dim {
-        dot += q[q_base + d] * kv_cache_k[k_off + d];
+        dot += f32::cast_from(q[q_base + d]) * f32::cast_from(kv_cache_k[k_off + d]);
         d += 1;
     }
     scores[h * max_seq + t] = dot * scale;
@@ -586,10 +597,10 @@ pub fn attention_softmax(
 
 #[cube(launch)]
 pub fn attention_output(
-    kv_cache_v: &Array<f32>,
+    kv_cache_v: &Array<Act>,
     weights: &Array<f32>,
     sums: &Array<f32>,
-    out: &mut Array<f32>,
+    out: &mut Array<Act>,
     pos: usize,
     head_dim: usize,
     n_heads: usize,
@@ -612,10 +623,10 @@ pub fn attention_output(
     let mut t = 0usize;
     while t <= pos {
         let v_off = t * kv_dim + kv_base;
-        acc += weights[h * max_seq + t] * kv_cache_v[v_off + d];
+        acc += weights[h * max_seq + t] * f32::cast_from(kv_cache_v[v_off + d]);
         t += 1;
     }
-    out[h * head_dim + d] = acc / sums[h];
+    out[h * head_dim + d] = Act::cast_from(acc / sums[h]);
 }
 
 // ── Helpers (no u8 anywhere — WGSL compatible) ────────────────────────
@@ -706,8 +717,8 @@ pub const DEQUANT_Q6_K: u32 = 14;
 #[cube(launch)]
 pub fn matmul_dequant_wgpu(
     w: &Array<u32>,
-    x: &Array<f32>,
-    out: &mut Array<f32>,
+    x: &Array<Act>,
+    out: &mut Array<Act>,
     dtype: u32,
     in_dim: usize,
     row_u32s: usize,
@@ -760,6 +771,65 @@ pub fn matmul_dequant_wgpu(
     sync_cube();
 
     if lane == 0 {
+        out[row] = Act::cast_from(smem[0] + smem[1]);
+    }
+}
+
+// Same matmul, but writes `f32` output. Used only for the LM head, whose logits
+// feed sampling/argmax and must keep full f32 precision even when the
+// activation stream (`x`, and the `Act` matmul above) is narrowed to f16.
+#[cube(launch)]
+pub fn matmul_dequant_wgpu_f32out(
+    w: &Array<u32>,
+    x: &Array<Act>,
+    out: &mut Array<f32>,
+    dtype: u32,
+    in_dim: usize,
+    row_u32s: usize,
+    grid_x: u32,
+) {
+    let row = (CUBE_POS_Y * grid_x + CUBE_POS_X) as usize;
+    let lane = UNIT_POS as usize;
+
+    if row >= out.len() {
+        terminate!();
+    }
+
+    let mut partial = 0.0f32;
+    if dtype == DEQUANT_Q8_0 {
+        partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s);
+    } else if dtype == DEQUANT_Q4_K {
+        partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s);
+    } else if dtype == DEQUANT_Q5_K {
+        partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s);
+    } else if dtype == DEQUANT_Q6_K {
+        partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s);
+    }
+
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    smem[lane] = partial;
+    sync_cube();
+    if lane < 32 {
+        smem[lane] += smem[lane + 32];
+    }
+    sync_cube();
+    if lane < 16 {
+        smem[lane] += smem[lane + 16];
+    }
+    sync_cube();
+    if lane < 8 {
+        smem[lane] += smem[lane + 8];
+    }
+    sync_cube();
+    if lane < 4 {
+        smem[lane] += smem[lane + 4];
+    }
+    sync_cube();
+    if lane < 2 {
+        smem[lane] += smem[lane + 2];
+    }
+    sync_cube();
+    if lane == 0 {
         out[row] = smem[0] + smem[1];
     }
 }
@@ -772,7 +842,7 @@ pub fn matmul_dequant_wgpu(
 #[cube]
 fn partial_q8_0(
     w: &Array<u32>,
-    x: &Array<f32>,
+    x: &Array<Act>,
     row: usize,
     lane: usize,
     in_dim: usize,
@@ -792,7 +862,7 @@ fn partial_q8_0(
             let idx = block_start + i;
             if idx < in_dim {
                 let q = read_i8_i32(w, byte_off + 2 + i) as f32;
-                dot += q * x[idx];
+                dot += q * f32::cast_from(x[idx]);
             }
             i += 1;
         }
@@ -812,7 +882,7 @@ fn partial_q8_0(
 #[cube]
 fn partial_q4_k(
     w: &Array<u32>,
-    x: &Array<f32>,
+    x: &Array<Act>,
     row: usize,
     lane: usize,
     in_dim: usize,
@@ -857,7 +927,7 @@ fn partial_q4_k(
             if idx < in_dim {
                 let qb = read_byte_u32(w, qs_byte_off + l);
                 let nibble = if low { qb & 0xFu32 } else { (qb >> 4u32) & 0xFu32 };
-                sum += (d_sc * (nibble as f32) - dmin_m) * x[idx];
+                sum += (d_sc * (nibble as f32) - dmin_m) * f32::cast_from(x[idx]);
             }
             l += 1;
         }
@@ -877,7 +947,7 @@ fn partial_q4_k(
 #[cube]
 fn partial_q5_k(
     w: &Array<u32>,
-    x: &Array<f32>,
+    x: &Array<Act>,
     row: usize,
     lane: usize,
     in_dim: usize,
@@ -922,7 +992,7 @@ fn partial_q5_k(
                     let hb = (qh_word >> shift) & 0xFFu32;
                     let hi_bit = (hb >> is) & 1u32;
                     let quant = nibble | (hi_bit << 4u32);
-                    sum += (d_sc * (quant as f32) - dmin_m) * x[idx];
+                    sum += (d_sc * (quant as f32) - dmin_m) * f32::cast_from(x[idx]);
                 }
                 sub += 1;
             }
@@ -943,7 +1013,7 @@ fn partial_q5_k(
 #[cube]
 fn partial_q6_k(
     w: &Array<u32>,
-    x: &Array<f32>,
+    x: &Array<Act>,
     row: usize,
     lane: usize,
     in_dim: usize,
@@ -982,19 +1052,19 @@ fn partial_q6_k(
 
         let idx0 = y_off + l;
         if idx0 < in_dim {
-            sum += d * sc0 * (q1 as f32) * x[idx0];
+            sum += d * sc0 * (q1 as f32) * f32::cast_from(x[idx0]);
         }
         let idx1 = idx0 + 32;
         if idx1 < in_dim {
-            sum += d * sc2 * (q2 as f32) * x[idx1];
+            sum += d * sc2 * (q2 as f32) * f32::cast_from(x[idx1]);
         }
         let idx2 = idx0 + 64;
         if idx2 < in_dim {
-            sum += d * sc4 * (q3 as f32) * x[idx2];
+            sum += d * sc4 * (q3 as f32) * f32::cast_from(x[idx2]);
         }
         let idx3 = idx0 + 96;
         if idx3 < in_dim {
-            sum += d * sc6 * (q4 as f32) * x[idx3];
+            sum += d * sc6 * (q4 as f32) * f32::cast_from(x[idx3]);
         }
 
         block += 1;

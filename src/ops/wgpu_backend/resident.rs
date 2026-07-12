@@ -16,11 +16,41 @@ impl WgpuBackend {
         x_handle: &cubecl::server::Handle,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(h.out_dim * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(h.out_dim * crate::ops::ACT_SIZE);
         let grid_x = (h.out_dim as u32).min(65535);
         let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
         unsafe {
             crate::ops::kernels::wgpu::matmul_dequant_wgpu::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, 1),
+                CubeDim::new_1d(64),
+                ArrayArg::from_raw_parts(h.handle.clone(), h.out_dim * h.row_u32s),
+                ArrayArg::from_raw_parts(x_handle.clone(), h.in_dim),
+                ArrayArg::from_raw_parts(out_handle.clone(), h.out_dim),
+                h.dtype as u32,
+                h.in_dim,
+                h.row_u32s,
+                grid_x,
+            );
+        }
+        out_handle
+    }
+
+    /// Same dequant matmul as [`launch_only`] but writes an `f32` output handle
+    /// (via the `matmul_dequant_wgpu_f32out` kernel). Used for the LM head so
+    /// its logits keep full f32 precision for sampling even when the activation
+    /// stream is f16. Returns an `f32`-sized handle.
+    pub(crate) fn launch_only_f32out(
+        &self,
+        h: &GpuWeightHandle,
+        x_handle: &cubecl::server::Handle,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        let out_handle = self.client.empty(h.out_dim * core::mem::size_of::<f32>());
+        let grid_x = (h.out_dim as u32).min(65535);
+        let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
+        unsafe {
+            crate::ops::kernels::wgpu::matmul_dequant_wgpu_f32out::launch::<WgpuRuntime>(
                 &self.client,
                 CubeCount::Static(grid_x, grid_y, 1),
                 CubeDim::new_1d(64),
@@ -45,7 +75,7 @@ impl WgpuBackend {
         len: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(len * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             let threads = 64u32;
             let workgroups = (len as u32 + threads - 1) / threads;
@@ -71,7 +101,7 @@ impl WgpuBackend {
         eps: f32,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(len * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             crate::ops::kernels::wgpu::rms_norm::launch::<WgpuRuntime>(
                 &self.client,
@@ -98,8 +128,8 @@ impl WgpuBackend {
         eps: f32,
     ) -> (cubecl::server::Handle, cubecl::server::Handle) {
         use cubecl::prelude::*;
-        let new_x_handle = self.client.empty(len * core::mem::size_of::<f32>());
-        let normed_handle = self.client.empty(len * core::mem::size_of::<f32>());
+        let new_x_handle = self.client.empty(len * crate::ops::ACT_SIZE);
+        let normed_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             crate::ops::kernels::wgpu::add_residual_rms_norm::launch::<WgpuRuntime>(
                 &self.client,
@@ -130,7 +160,7 @@ impl WgpuBackend {
         d: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(d * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(d * crate::ops::ACT_SIZE);
         unsafe {
             let threads = 64u32;
             let workgroups = (d as u32 + threads - 1) / threads;
@@ -210,8 +240,8 @@ impl WgpuBackend {
         n_heads: usize,
     ) -> (cubecl::server::Handle, cubecl::server::Handle) {
         use cubecl::prelude::*;
-        let q_handle = self.client.empty(n_heads * head_dim * core::mem::size_of::<f32>());
-        let gate_handle = self.client.empty(n_heads * head_dim * core::mem::size_of::<f32>());
+        let q_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
+        let gate_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
         let threads = 64u32;
         let workgroups = ((n_heads * head_dim) as u32 + threads - 1) / threads;
         unsafe {
@@ -237,7 +267,7 @@ impl WgpuBackend {
         len: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(len * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         let threads = 64u32;
         let workgroups = (len as u32 + threads - 1) / threads;
         unsafe {
@@ -336,7 +366,7 @@ impl WgpuBackend {
         max_seq: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(n_heads * head_dim * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
         let sums_handle = self.client.empty(n_heads * core::mem::size_of::<f32>());
         let threads = 64u32;
 
@@ -397,14 +427,26 @@ impl WgpuBackend {
         out_handle
     }
 
-    /// Upload a plain f32 activation/weight vector to GPU (no packing —
-    /// used for embeddings and norm vectors, which are always f32).
+    /// Upload a plain f32 vector to GPU as f32 (no packing). Used for the
+    /// weights/state the resident kernels read as `f32`: norm vectors, conv
+    /// tap weights, GDN SSM params, the (f32) recurrent conv/state histories,
+    /// and the attention score/softmax scratch.
     pub(crate) fn upload_activation(&self, x: &[f32]) -> cubecl::server::Handle {
         use cubecl::prelude::*;
         self.client.create_from_slice(f32::as_bytes(x))
     }
 
-    /// Blocking read of a GPU handle back to a `Vec<f32>` of length `len`.
+    /// Upload a plain f32 vector to GPU as the activation storage type [`Act`]
+    /// (f16 by default). Used for the actual activation stream — the embedding
+    /// that seeds `x_handle`, and the KV-cache buffers the resident kernels
+    /// read/write as `Act`.
+    pub(crate) fn upload_act(&self, x: &[f32]) -> cubecl::server::Handle {
+        self.client.create_from_slice(&crate::ops::act_encode(x))
+    }
+
+    /// Blocking read of an `f32` GPU handle back to `Vec<f32>` of length `len`.
+    /// The only resident readback is the LM-head logits, which are produced by
+    /// the `f32out` matmul and so stay full-precision f32.
     pub(crate) fn read_handle(&self, h: cubecl::server::Handle, len: usize) -> Vec<f32> {
         use cubecl::prelude::*;
         let bytes = self.client.read_one_unchecked(h);
@@ -530,7 +572,7 @@ impl WgpuBackend {
         d_conv: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
-        let out_handle = self.client.empty(conv_dim * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(conv_dim * crate::ops::ACT_SIZE);
         let threads = 64u32;
         let workgroups = (conv_dim as u32 + threads - 1) / threads;
         unsafe {
@@ -569,7 +611,7 @@ impl WgpuBackend {
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
         let value_dim = n_v_heads * head_v_dim;
-        let out_handle = self.client.empty(value_dim * core::mem::size_of::<f32>());
+        let out_handle = self.client.empty(value_dim * crate::ops::ACT_SIZE);
         unsafe {
             crate::ops::kernels::wgpu::gdn_recurrence::launch::<WgpuRuntime>(
                 &self.client,

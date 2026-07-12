@@ -31,6 +31,22 @@ impl WgpuBackend {
     pub fn new() -> Self {
         let device = WgpuDevice::default();
         let client = WgpuRuntime::client(&device);
+        // Default build stores activations as f16; require the device to
+        // actually support shader-f16 so a mis-built binary fails loudly here
+        // rather than silently corrupting activations (e.g. wgpu→Metal, which
+        // should be built with `--features f32-activations`).
+        #[cfg(not(feature = "f32-activations"))]
+        {
+            let f16_ok = client
+                .properties()
+                .features
+                .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16));
+            assert!(
+                f16_ok,
+                "f16 activations are the default but this wgpu device does not advertise \
+                 shader-f16. Rebuild with `--features f32-activations` for this backend."
+            );
+        }
         Self { client }
     }
 
@@ -87,7 +103,10 @@ impl WgpuBackend {
         let trace = trace_matmul_enabled();
 
         let t0 = Instant::now();
-        let x_handle = self.client.create_from_slice(f32::as_bytes(x));
+        // CPU-orchestrated (non-resident) path: `x` is uploaded as the `Act`
+        // activation type the matmul reads, and the `f32out` kernel keeps the
+        // CPU-side result f32.
+        let x_handle = self.client.create_from_slice(&crate::ops::act_encode(x));
         let out_handle = self.client.empty(h.out_dim * core::mem::size_of::<f32>());
         let alloc_time = t0.elapsed();
 
@@ -95,7 +114,7 @@ impl WgpuBackend {
         let grid_x = (h.out_dim as u32).min(65535);
         let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
         unsafe {
-            crate::ops::kernels::wgpu::matmul_dequant_wgpu::launch::<WgpuRuntime>(
+            crate::ops::kernels::wgpu::matmul_dequant_wgpu_f32out::launch::<WgpuRuntime>(
                 &self.client,
                 CubeCount::Static(grid_x, grid_y, 1),
                 CubeDim::new_1d(64),
@@ -143,7 +162,7 @@ impl WgpuBackend {
         k: &mut [f32],
         v: &mut [f32],
     ) -> Result<()> {
-        let x_handle = self.upload_activation(x);
+        let x_handle = self.upload_act(x);
         self.matmul_dequant_qkv_from_handle(hq, hk, hv, &x_handle, q, k, v)
     }
 
@@ -165,9 +184,9 @@ impl WgpuBackend {
         let trace = trace_matmul_enabled();
 
         let t0 = Instant::now();
-        let out_q = self.launch_only(hq, x_handle);
-        let out_k = self.launch_only(hk, x_handle);
-        let out_v = self.launch_only(hv, x_handle);
+        let out_q = self.launch_only_f32out(hq, x_handle);
+        let out_k = self.launch_only_f32out(hk, x_handle);
+        let out_v = self.launch_only_f32out(hv, x_handle);
         let launch_time = t0.elapsed();
 
         let t0 = Instant::now();
@@ -203,7 +222,7 @@ impl WgpuBackend {
         x: &[f32],
         outs: &mut [&mut [f32]],
     ) -> Result<()> {
-        let x_handle = self.upload_activation(x);
+        let x_handle = self.upload_act(x);
         self.matmul_dequant_multi_from_handle(hs, &x_handle, outs)
     }
 
@@ -221,7 +240,7 @@ impl WgpuBackend {
         let trace = trace_matmul_enabled();
 
         let t0 = Instant::now();
-        let handles: Vec<_> = hs.iter().map(|h| self.launch_only(h, &x_handle)).collect();
+        let handles: Vec<_> = hs.iter().map(|h| self.launch_only_f32out(h, &x_handle)).collect();
         let launch_time = t0.elapsed();
 
         let t0 = Instant::now();
@@ -259,7 +278,7 @@ impl WgpuBackend {
     ) -> Result<()> {
         use std::time::Instant;
         let t0 = Instant::now();
-        let x_handle = self.upload_activation(x);
+        let x_handle = self.upload_act(x);
         let upload_time = t0.elapsed();
 
         let t0 = Instant::now();
@@ -267,7 +286,10 @@ impl WgpuBackend {
         let launch_time = t0.elapsed();
 
         let t0 = Instant::now();
-        let actual = self.read_handle(down_handle, h_down.out_dim);
+        // `ffn_chain_from_handle` returns an `Act` handle (shared with the
+        // resident path); decode it back to f32 for the CPU-side result.
+        let down_bytes = self.client.read_one_unchecked(down_handle);
+        let actual = crate::ops::act_decode(&down_bytes, h_down.out_dim);
         let read_time = t0.elapsed();
         out.copy_from_slice(&actual);
 

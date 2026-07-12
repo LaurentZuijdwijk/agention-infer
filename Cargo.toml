@@ -27,6 +27,13 @@ hip   = ["cubecl/hip"]
 cuda  = ["cubecl/cuda"]
 wgpu  = ["cubecl/wgpu"]
 metal = ["cubecl/metal"]
+# f16 intermediate activations on the GPU-resident path (Stage 4) are the
+# DEFAULT fast path — they halve activation bandwidth on shader-f16-capable
+# backends (Vulkan/RDNA, the primary target). Build with `f32-activations` to
+# opt back into f32 storage where the backend lacks shader-f16 (e.g. wgpu→Metal):
+# `--features wgpu,metal,f32-activations`. WgpuBackend asserts the device
+# advertises F16 at startup unless this opt-out is set.
+f32-activations = []
 # Standalone raw-Vulkan dispatch-overhead prototype (src/bin/vulkan_poc.rs) —
 # not part of the engine, just measuring whether bypassing wgpu's per-dispatch
 # bookkeeping actually lowers per-dispatch cost on this hardware.

@@ -185,8 +185,9 @@ impl<'a> LlamaModel<'a> {
         let mut new_kv = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if matches!(layer.mixer, Mixer::Attention { .. } | Mixer::GatedAttention { .. }) {
-                let hk = wgpu.upload_activation(&zeros);
-                let hv = wgpu.upload_activation(&zeros);
+                // KV cache stores the `Act` activation type (f16 by default).
+                let hk = wgpu.upload_act(&zeros);
+                let hv = wgpu.upload_act(&zeros);
                 new_kv.push((i, hk, hv));
             }
         }
@@ -330,7 +331,7 @@ impl<'a> LlamaModel<'a> {
         let d_model = self.cfg.embedding_length as usize;
 
         let embd = self.weights.dequant_row(&self.token_embd, token as usize)?;
-        let mut x_handle = b.upload_activation(&embd);
+        let mut x_handle = b.upload_act(&embd);
         // Every `residual_add` below is immediately followed by an
         // `rms_norm` (the next mixer's/FFN's prenorm, or the final output
         // norm) — `launch_add_residual_rms_norm` fuses each such pair into
@@ -580,7 +581,9 @@ impl<'a> LlamaModel<'a> {
         // holds the output-norm-applied residual stream, fused into the last
         // layer's FFN residual-add above.
         let h_lm = &self.gpu_tensors[&self.lm_head];
-        let logits_handle = b.launch_only(h_lm, &xn_handle);
+        // f32-output matmul: logits stay full-precision for sampling/argmax
+        // even though `xn_handle` is f16.
+        let logits_handle = b.launch_only_f32out(h_lm, &xn_handle);
         Ok(b.read_handle(logits_handle, h_lm.out_dim()))
     }
 }
