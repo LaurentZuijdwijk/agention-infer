@@ -982,6 +982,26 @@ prefill / flash attention.
 
 ---
 
+## Priority 22: GPU Path — `short_conv` (LFM2 ShortConv Mixer) ✅ PROFILED, NO FIX NEEDED
+
+**Status:** ✅ Profiled 2026-07-13 (`WgpuBackend::probe_short_conv_cost`) —
+this session's Priorities 16/17/19/20 all profiled the Qwen3.5-9B (attention +
+GatedDeltaNet) resident path; `short_conv` is LFM2's mixer and hadn't been
+checked with this methodology. It's already fine: one thread per channel
+(`d=2048` for LFM2.5-1.2B → 32 workgroups, 2048 total threads), no internal
+loop over a value axis, no cross-thread sync — the same "already parallel"
+shape as `attention_output`, not the "one thread per head" shape that needed
+fixing elsewhere. Measured **0.0077ms/dispatch**, at the dispatch floor.
+LFM2.5-1.2B decode: 116.5 tok/s, 32.8% of its (much higher, smaller-model)
+bandwidth ceiling — already benefits from Priorities 16/17/20's shared
+kernels (RMSNorm, softmax, etc. are used by every architecture).
+
+**Effort:** N/A (no fix applied) | **Impact:** N/A — confirms the
+"already-parallel" kernel shapes generalize correctly to the other
+architecture in this codebase, no hidden bug found.
+
+---
+
 ## CubeCL Upgrade & Vulkan Library Investigation (2026-07-13)
 
 Prompted by "should we look at a different GPU library" after Priority 20's
@@ -1087,6 +1107,7 @@ if quality loss is acceptable for a given use case.
 | 19 | GPU: GDN recurrence kernel | N/A | N/A | ✅ Profiled, already well-parallelized — no fix; found ~20% chain pipeline-switch tax instead |
 | 20 | CubeCL `FastMath`/`FastDivmod` micro-opts | Low | None | ❌ Tested, zero measurable effect — reverted |
 | 21 | CMMA / cooperative-matrix hardware | Very High (unbuilt) | Unknown | ✅ Capability confirmed on this GPU (CubeCL `main`); not adopted — Phase 2 candidate |
+| 22 | GPU: `short_conv` (LFM2 mixer) | N/A | N/A | ✅ Profiled, already well-parallelized — no fix needed |
 
 ---
 

@@ -608,6 +608,36 @@ impl WgpuBackend {
         );
     }
 
+    /// Micro-benchmark `short_conv` (LFM2's depthwise causal conv1d mixer):
+    /// one thread per channel (`d` total, `ceil(d/64)` workgroups) with no
+    /// cross-thread sync — checks whether this already-parallel-looking
+    /// kernel hides the same under-occupancy anti-pattern as RMSNorm/softmax
+    /// did, or is fine as-is (prediction: fine, since it's one-thread-per-
+    /// channel like attention_output, not one-thread-per-head like the
+    /// kernels that needed fixing).
+    pub fn probe_short_conv_cost(&self, d: usize, l: usize, k: usize) {
+        use std::time::Instant;
+
+        let bcx = self.upload_act(&vec![0.1f32; 3 * d]);
+        let weight = self.upload_activation(&vec![0.1f32; d * l]);
+        let history = self.upload_activation(&vec![0.0f32; d * l.saturating_sub(1)]);
+
+        println!("\nshort_conv: d={d} l={l} (workgroups=ceil(d/64)={})", (d + 63) / 64);
+
+        for _ in 0..3 {
+            let o = self.launch_short_conv(&bcx, &weight, &history, l, d);
+            let _ = self.client.read_one_unchecked(o);
+        }
+        let t0 = Instant::now();
+        let mut last = None;
+        for _ in 0..k {
+            last = Some(self.launch_short_conv(&bcx, &weight, &history, l, d));
+        }
+        let _ = self.client.read_one_unchecked(last.unwrap());
+        let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+        println!("short_conv: {ms:.4} ms/dispatch (called once per ShortConv layer per token)");
+    }
+
     /// Launch the consolidated dequant matmul using a pre-uploaded weight tensor.
     pub fn matmul_dequant_preloaded(
         &self,
