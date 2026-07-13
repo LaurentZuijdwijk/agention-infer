@@ -47,10 +47,15 @@ fn main() {
     );
 
     let n_heads = cfg.head_count as usize;
+    let n_kv_heads = cfg.head_count_kv as usize;
     let head_dim = cfg.head_dim as usize;
     let backend = WgpuBackend::new();
     let h = backend.upload_weight(tensor.ggml_type, bytes, in_dim);
     backend.probe_kernel_costs(&h, d, ff, n_heads, head_dim, 500);
+
+    let max_seq = 2048;
+    let positions = [0usize, 15, 63, 255, 1023, 2047];
+    backend.probe_attention_costs(n_heads, n_kv_heads, head_dim, max_seq, &positions, 200);
 }
 
 #[cfg(not(feature = "wgpu"))]

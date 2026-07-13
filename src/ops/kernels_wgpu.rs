@@ -645,6 +645,16 @@ pub fn attention_scores(
     scores[h * max_seq + t] = dot * scale;
 }
 
+// One workgroup per head, 64 cooperating lanes — was one thread per head
+// serially scanning `0..=pos` twice (once for the max, once for the sum),
+// each iteration an `exp()` call. At the ~16-32 heads typical for this model
+// that's only ~16-32 threads total, active for O(pos) iterations each — the
+// same under-occupancy anti-pattern the RMSNorm fix addressed, and it grows
+// directly with context length (measured ~0.34ms/call at pos=2047 pre-fix).
+// Two-phase cooperative reduction: lanes split the `0..=pos` range for a
+// strided max reduction, then (after broadcasting `max_score` via `smem[0]`)
+// split it again for the exp+sum reduction. Launch `CubeCount(n_heads,1,1)`,
+// `CubeDim(64)`.
 #[cube(launch)]
 pub fn attention_softmax(
     scores: &Array<f32>,
@@ -654,28 +664,66 @@ pub fn attention_softmax(
     n_heads: usize,
     max_seq: usize,
 ) {
-    let h = ABSOLUTE_POS;
+    let h = CUBE_POS_X as usize;
+    let lane = UNIT_POS as usize;
+    let nlanes = CUBE_DIM as usize;
     if h >= n_heads {
         terminate!();
     }
+    let seq_len = pos + 1;
 
-    let max_cell = RuntimeCell::<f32>::new(-1.0e30f32);
-    let mut t = 0usize;
-    while t <= pos {
-        max_cell.store(max(max_cell.read(), scores[h * max_seq + t]));
-        t += 1;
+    // Phase 1: cooperative max reduction. Per-lane running max uses
+    // `RuntimeCell` — a self-referential `x = max(x, v)`/`x += max(v-x, 0)`
+    // update on a plain mutable scalar hits a distinct cubecl codegen panic
+    // ("mutable operation on a const variable") here, same reason the
+    // original single-threaded version used `RuntimeCell` for its max scan.
+    // The cross-lane tree reduction writes plain (non-self-referential) `=`
+    // into `SharedMemory` element, which is not subject to that restriction.
+    let local_max_cell = RuntimeCell::<f32>::new(-1.0e30f32);
+    let mut t = lane;
+    while t < seq_len {
+        let v = scores[h * max_seq + t];
+        local_max_cell.store(max(local_max_cell.read(), v));
+        t += nlanes;
     }
-    let max_score = max_cell.read();
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    smem[lane] = local_max_cell.read();
+    sync_cube();
+    let mut stride = nlanes / 2;
+    while stride >= 1 {
+        if lane < stride {
+            let a = smem[lane];
+            let b = smem[lane + stride];
+            smem[lane] = max(a, b);
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let max_score = smem[0];
+    sync_cube();
 
-    let mut sum_exp = 0.0f32;
-    let mut t2 = 0usize;
-    while t2 <= pos {
+    // Phase 2: cooperative exp + sum reduction, reusing `smem`.
+    let mut local_sum = 0.0f32;
+    let mut t2 = lane;
+    while t2 < seq_len {
         let w = (scores[h * max_seq + t2] - max_score).exp();
         weights[h * max_seq + t2] = w;
-        sum_exp += w;
-        t2 += 1;
+        local_sum += w;
+        t2 += nlanes;
     }
-    sums[h] = sum_exp;
+    smem[lane] = local_sum;
+    sync_cube();
+    let mut stride2 = nlanes / 2;
+    while stride2 >= 1 {
+        if lane < stride2 {
+            smem[lane] += smem[lane + stride2];
+        }
+        sync_cube();
+        stride2 /= 2;
+    }
+    if lane == 0 {
+        sums[h] = smem[0];
+    }
 }
 
 #[cube(launch)]

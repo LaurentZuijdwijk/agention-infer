@@ -515,12 +515,12 @@ impl WgpuBackend {
             );
         }
 
-        // 2. Numerically-stable softmax: one thread per head.
-        let wg_softmax = (n_heads as u32 + threads - 1) / threads;
+        // 2. Numerically-stable softmax: one workgroup per head, 64
+        // cooperating lanes (was one thread per head — see kernel doc).
         unsafe {
             crate::ops::kernels::wgpu::attention_softmax::launch::<WgpuRuntime>(
                 &self.client,
-                CubeCount::Static(wg_softmax, 1, 1),
+                CubeCount::Static(n_heads as u32, 1, 1),
                 CubeDim::new_1d(threads),
                 ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
                 ArrayArg::from_raw_parts(weights.clone(), n_heads * max_seq),

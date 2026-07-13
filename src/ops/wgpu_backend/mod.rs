@@ -254,6 +254,129 @@ impl WgpuBackend {
         );
     }
 
+    /// Micro-benchmark the three attention kernels individually (they're
+    /// normally fused into one `launch_attention` call with no sync between
+    /// them) at several context depths (`pos` values), to test whether
+    /// `attention_softmax` — one thread per head, serially reducing over
+    /// `0..=pos` — degrades at long context the same way the (also
+    /// "should be cheap serial") RMSNorm kernels turned out not to be.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_attention_costs(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        positions: &[usize],
+        k: usize,
+    ) {
+        use cubecl::prelude::*;
+        use std::time::Instant;
+
+        let kv_dim = n_kv_heads * head_dim;
+        let q = self.upload_act(&vec![1.0f32; n_heads * head_dim]);
+        let k_cache = self.upload_act(&vec![1.0f32; max_seq * kv_dim]);
+        let v_cache = self.upload_act(&vec![1.0f32; max_seq * kv_dim]);
+        let scores = self.upload_activation(&vec![0.0f32; n_heads * max_seq]);
+        let weights = self.upload_activation(&vec![0.0f32; n_heads * max_seq]);
+        let sums = self.upload_activation(&vec![0.0f32; n_heads]);
+        let threads = 64u32;
+
+        println!(
+            "\n{:>8}  {:>12}  {:>12}  {:>12}  {:>12}",
+            "pos", "scores(ms)", "softmax(ms)", "output(ms)", "total(ms)"
+        );
+
+        for &pos in positions {
+            let seq_len = pos + 1;
+
+            // Warm up.
+            for _ in 0..2 {
+                let wg = (n_heads as u32 * seq_len as u32 + threads - 1) / threads;
+                unsafe {
+                    crate::ops::kernels::wgpu::attention_scores::launch::<WgpuRuntime>(
+                        &self.client,
+                        CubeCount::Static(wg, 1, 1),
+                        CubeDim::new_1d(threads),
+                        ArrayArg::from_raw_parts(q.clone(), n_heads * head_dim),
+                        ArrayArg::from_raw_parts(k_cache.clone(), max_seq * kv_dim),
+                        ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
+                        pos, head_dim, n_heads, n_kv_heads, max_seq,
+                    );
+                }
+                let _ = self.client.read_one_unchecked(scores.clone());
+            }
+
+            // 1. attention_scores.
+            let wg_scores = (n_heads as u32 * seq_len as u32 + threads - 1) / threads;
+            let t0 = Instant::now();
+            for _ in 0..k {
+                unsafe {
+                    crate::ops::kernels::wgpu::attention_scores::launch::<WgpuRuntime>(
+                        &self.client,
+                        CubeCount::Static(wg_scores, 1, 1),
+                        CubeDim::new_1d(threads),
+                        ArrayArg::from_raw_parts(q.clone(), n_heads * head_dim),
+                        ArrayArg::from_raw_parts(k_cache.clone(), max_seq * kv_dim),
+                        ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
+                        pos, head_dim, n_heads, n_kv_heads, max_seq,
+                    );
+                }
+            }
+            let _ = self.client.read_one_unchecked(scores.clone());
+            let scores_ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+
+            // 2. attention_softmax (one workgroup per head).
+            let t0 = Instant::now();
+            for _ in 0..k {
+                unsafe {
+                    crate::ops::kernels::wgpu::attention_softmax::launch::<WgpuRuntime>(
+                        &self.client,
+                        CubeCount::Static(n_heads as u32, 1, 1),
+                        CubeDim::new_1d(threads),
+                        ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
+                        ArrayArg::from_raw_parts(weights.clone(), n_heads * max_seq),
+                        ArrayArg::from_raw_parts(sums.clone(), n_heads),
+                        pos, n_heads, max_seq,
+                    );
+                }
+            }
+            let _ = self.client.read_one_unchecked(weights.clone());
+            let softmax_ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+
+            // 3. attention_output.
+            let out_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
+            let wg_out = (n_heads as u32 * head_dim as u32 + threads - 1) / threads;
+            let t0 = Instant::now();
+            for _ in 0..k {
+                unsafe {
+                    crate::ops::kernels::wgpu::attention_output::launch::<WgpuRuntime>(
+                        &self.client,
+                        CubeCount::Static(wg_out, 1, 1),
+                        CubeDim::new_1d(threads),
+                        ArrayArg::from_raw_parts(v_cache.clone(), max_seq * kv_dim),
+                        ArrayArg::from_raw_parts(weights.clone(), n_heads * max_seq),
+                        ArrayArg::from_raw_parts(sums.clone(), n_heads),
+                        ArrayArg::from_raw_parts(out_handle.clone(), n_heads * head_dim),
+                        pos, head_dim, n_heads, n_kv_heads, max_seq,
+                    );
+                }
+            }
+            let _ = self.client.read_one_unchecked(out_handle);
+            let output_ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+
+            println!(
+                "{pos:>8}  {scores_ms:>12.4}  {softmax_ms:>12.4}  {output_ms:>12.4}  {:>12.4}",
+                scores_ms + softmax_ms + output_ms
+            );
+        }
+        println!(
+            "\nIf softmax(ms) grows with pos while scores/output stay flat-ish, the 1-thread-per-head\n\
+             serial softmax degrades at long context — same anti-pattern as the RMSNorm fix, worth\n\
+             parallelizing with a per-head cooperative reduction."
+        );
+    }
+
     /// Launch the consolidated dequant matmul using a pre-uploaded weight tensor.
     pub fn matmul_dequant_preloaded(
         &self,
