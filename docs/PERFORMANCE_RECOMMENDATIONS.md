@@ -676,7 +676,7 @@ have actually worked so far.
 
 ---
 
-## Priority 14: GPU Path — Vectorized Byte Reads in Quant Dequant Kernels ✅ IMPLEMENTED FOR Q4_K, Q5_K/Q6_K OPEN
+## Priority 14: GPU Path — Vectorized Byte Reads in Quant Dequant Kernels ✅ Q4_K DONE, Q5_K ALREADY DONE (predates this doc), Q6_K NOT THE SAME BUG
 
 **Status:** ✅ Done for Q4_K 2026-07-13 — this was the single biggest win of
 that session, exactly as the 2026-07-08 proposal below predicted ("safe
@@ -700,22 +700,39 @@ Golden token-parity green on all 4 models, CPU + GPU (this is a
 bit-manipulation change to quant unpacking — correctness-critical to verify,
 and was).
 
-**Q5_K and Q6_K are still open.** Q5_K's 176-byte blocks are 4-aligned (same
-fix applies directly); Q6_K's 210-byte blocks are **not** 4-aligned (the
-original caveat below still applies — needs unaligned-read handling,
-combining parts of two words). Worth doing if a Q5_K/Q6_K-heavy model becomes
-a target; this session's model (Qwen3.5-9B-Q4_K_M) is Q4_K-dominant so Q6_K
-wasn't pursued.
+**Correction (2026-07-13, later the same day): both "still open" claims below
+were wrong on inspection — checked before doing any more work, not after.**
 
-**Original 2026-07-08 proposal (superseded by the Q4_K result above; kept for
-the Q6_K alignment caveat):** llama.cpp's Vulkan `mul_mat_vec_q4_k.comp` (see
+- **Q5_K was already vectorized** — `partial_q5_k` already reads one `u32`
+  word per 4 bytes (`w[(qs_byte_off + l) / 4]`, unpacking 4 shifted extracts)
+  for both the quant bytes and the high-bit `qh` array. This predates the
+  original 2026-07-08 proposal (commit `343ac0b`, same calendar day, timestamp
+  earlier) — the proposal's claim that Q5_K had the same bug was simply wrong
+  even when written. Nothing to do here.
+- **Q6_K does *not* have the same bug**, on closer reading of its actual
+  thread-assignment pattern. `partial_q4_k`/`partial_q5_k` assign *multiple*
+  sub-units to each thread via an internal loop (`while l < 32 { ... }`) — that
+  loop is what re-read the same word repeatedly. `partial_q6_k` assigns
+  exactly **one** lane-specific offset to each thread with no such loop (only
+  loops over `block`, a different axis) — `ql0`/`ql1`/`qh_byte` are each a
+  single `read_byte_u32` call per thread, and adjacent lanes reading adjacent
+  bytes is the normal GPU-coalesced access pattern, not a redundant re-read.
+  There *is* a small, genuine instance of the pattern in the **scale** reads
+  (`sc0/sc2/sc4/sc6`, four `read_i8_i32` calls 2 bytes apart, pairing into 2
+  shared words) — but that's 4 scale bytes vs. Q4_K's 32 quant bytes, and
+  `output.weight` (Q6_K's only user, the LM head) is called once per token,
+  not ~30× like the FFN/attention matmuls. Bounded to a fraction of one
+  dispatch/token — not worth the bit-manipulation correctness risk right now.
+
+**Original 2026-07-08 proposal (superseded by the Q4_K result and the
+correction above):** llama.cpp's Vulkan `mul_mat_vec_q4_k.comp` (see
 `~/Projects/llama-cpp-turboquant/ggml/src/ggml-vulkan/vulkan-shaders/`) does
-the same kind of unpacking (`unpack8` on a `u32`, `vec4` loads) — worth
-pulling the actual bit-tricks from there if Q6_K is tackled, rather than
-re-deriving them.
+the same kind of unpacking — this remains a good reference if the small Q6_K
+scale-read optimization is ever revisited.
 
 **Effort:** Medium (careful bit-manipulation, real correctness risk) |
-**Impact:** Confirmed High for Q4_K — 1.9× the dominant per-token matmul cost.
+**Impact:** Confirmed High for Q4_K (1.9× the dominant per-token matmul cost);
+Q5_K already captured; Q6_K's remaining opportunity is small and bounded.
 
 ---
 
@@ -1062,7 +1079,7 @@ if quality loss is acceptable for a given use case.
 | 11 | GPU: attention softmax parallelism | Low | High (at long context) | ✅ Done — 23× at pos=2047; fusion-into-scores idea still not attempted |
 | 12 | GPU: ad-hoc matmul re-packs+re-uploads | Low-Medium | High (if hit) | ❌ Open |
 | 13 | GPU: no prefill batching | High | High | ❌ Superseded by #18 — tested, dtype-dependent, not adopted |
-| 14 | GPU: vectorized byte reads in dequant kernels (Q4_K) | Medium | High | ✅ Done — matmul 1.9×, decode +26%; Q5_K/Q6_K still open |
+| 14 | GPU: vectorized byte reads in dequant kernels (Q4_K) | Medium | High | ✅ Q4_K done (matmul 1.9×, decode +26%); Q5_K already done pre-session; Q6_K not the same bug, skip |
 | 15 | GPU: f16 intermediate activations | High | Low-Medium (confirmed) | ✅ Done — only ~2-3%, workload wasn't bandwidth-bound yet |
 | 16 | GPU: RMSNorm ran single-threaded | Low | Very High | ✅ Done — 38-45× kernel, decode +65% (biggest win this doc) |
 | 17 | GPU: per-head norms (qk_norm/l2_norm/gdn_norm) 1 thread/head | Low | Medium | ✅ Done — 21× on qk_norm_rope |
