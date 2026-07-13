@@ -10,12 +10,13 @@ impl WgpuBackend {
     /// Launch a dequant matmul without reading the result back — caller
     /// batches multiple `launch_only` calls, then reads them all with one
     /// `client.read`, instead of paying a blocking round-trip per matmul.
-    pub(crate) fn launch_only(
+    pub fn launch_only(
         &self,
         h: &GpuWeightHandle,
         x_handle: &cubecl::server::Handle,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_only");
         let out_handle = self.client.empty(h.out_dim * crate::ops::ACT_SIZE);
         let grid_x = (h.out_dim as u32).min(65535);
         let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
@@ -40,12 +41,13 @@ impl WgpuBackend {
     /// (via the `matmul_dequant_wgpu_f32out` kernel). Used for the LM head so
     /// its logits keep full f32 precision for sampling even when the activation
     /// stream is f16. Returns an `f32`-sized handle.
-    pub(crate) fn launch_only_f32out(
+    pub fn launch_only_f32out(
         &self,
         h: &GpuWeightHandle,
         x_handle: &cubecl::server::Handle,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_only_f32out");
         let out_handle = self.client.empty(h.out_dim * core::mem::size_of::<f32>());
         let grid_x = (h.out_dim as u32).min(65535);
         let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
@@ -66,15 +68,130 @@ impl WgpuBackend {
         out_handle
     }
 
+    /// Batched dequant matmul for prefill: `x_batch` is `[n, in_dim]`
+    /// token-major, returns an `[n, out_dim]` token-major `Act` handle. One
+    /// dispatch reads the weight tensor once (see `matmul_dequant_wgpu_batch`)
+    /// instead of the `n` weight sweeps that `n` separate `launch_only` calls
+    /// would cost. Workgroup count stays `out_dim` (decode's shape).
+    pub fn launch_only_batch(
+        &self,
+        h: &GpuWeightHandle,
+        x_batch: &cubecl::server::Handle,
+        n: usize,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_only_batch");
+        let out_handle = self.client.empty(n * h.out_dim * crate::ops::ACT_SIZE);
+        let grid_x = (h.out_dim as u32).min(65535);
+        let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
+        unsafe {
+            crate::ops::kernels::wgpu::matmul_dequant_wgpu_batch::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, 1),
+                CubeDim::new_1d(64),
+                ArrayArg::from_raw_parts(h.handle.clone(), h.out_dim * h.row_u32s),
+                ArrayArg::from_raw_parts(x_batch.clone(), n * h.in_dim),
+                ArrayArg::from_raw_parts(out_handle.clone(), n * h.out_dim),
+                h.dtype as u32,
+                h.in_dim,
+                h.out_dim,
+                n,
+                h.row_u32s,
+                grid_x,
+            );
+        }
+        out_handle
+    }
+
+    /// Cooperative batched matmul (Q8_0 only, `in_dim <= 4096`): dequantizes
+    /// each weight row into LDS once, then dots vs all `n` tokens. Experimental
+    /// — tests whether the matmul is dequant-compute-bound. `x_batch` is
+    /// `[n, in_dim]`, returns `[n, out_dim]` `Act`.
+    pub fn launch_coop_q8_0_batch(
+        &self,
+        h: &GpuWeightHandle,
+        x_batch: &cubecl::server::Handle,
+        n: usize,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_coop_q8_0_batch");
+        let out_handle = self.client.empty(n * h.out_dim * crate::ops::ACT_SIZE);
+        let grid_x = (h.out_dim as u32).min(65535);
+        let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
+        unsafe {
+            crate::ops::kernels::wgpu::matmul_q8_0_coop_batch::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, 1),
+                CubeDim::new_1d(64),
+                ArrayArg::from_raw_parts(h.handle.clone(), h.out_dim * h.row_u32s),
+                ArrayArg::from_raw_parts(x_batch.clone(), n * h.in_dim),
+                ArrayArg::from_raw_parts(out_handle.clone(), n * h.out_dim),
+                h.in_dim,
+                h.out_dim,
+                n,
+                h.row_u32s,
+                grid_x,
+            );
+        }
+        out_handle
+    }
+
+    /// Cooperative batched matmul (Q4_K only, `in_dim <= 4096`). See
+    /// [`Self::launch_coop_q8_0_batch`].
+    pub fn launch_coop_q4_k_batch(
+        &self,
+        h: &GpuWeightHandle,
+        x_batch: &cubecl::server::Handle,
+        n: usize,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_coop_q4_k_batch");
+        let out_handle = self.client.empty(n * h.out_dim * crate::ops::ACT_SIZE);
+        let grid_x = (h.out_dim as u32).min(65535);
+        let grid_y = ((h.out_dim as u32) + grid_x - 1) / grid_x;
+        unsafe {
+            crate::ops::kernels::wgpu::matmul_q4_k_coop_batch::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, 1),
+                CubeDim::new_1d(64),
+                ArrayArg::from_raw_parts(h.handle.clone(), h.out_dim * h.row_u32s),
+                ArrayArg::from_raw_parts(x_batch.clone(), n * h.in_dim),
+                ArrayArg::from_raw_parts(out_handle.clone(), n * h.out_dim),
+                h.in_dim,
+                h.out_dim,
+                n,
+                h.row_u32s,
+                grid_x,
+            );
+        }
+        out_handle
+    }
+
+    /// Dispatch the cooperative batched matmul for the weight's dtype (Q8_0 or
+    /// Q4_K; both require `in_dim <= 4096`). Panics for other dtypes.
+    pub fn launch_coop_batch(
+        &self,
+        h: &GpuWeightHandle,
+        x_batch: &cubecl::server::Handle,
+        n: usize,
+    ) -> cubecl::server::Handle {
+        match h.shape().0 {
+            crate::types::GgmlType::Q8_0 => self.launch_coop_q8_0_batch(h, x_batch, n),
+            crate::types::GgmlType::Q4_K => self.launch_coop_q4_k_batch(h, x_batch, n),
+            other => panic!("launch_coop_batch: no cooperative kernel for {other:?}"),
+        }
+    }
+
     /// Launch the SwiGLU combine kernel reading two GPU-resident buffers
     /// directly (no CPU round-trip for `gate`/`up`).
-    pub(crate) fn launch_silu_mul(
+    pub fn launch_silu_mul(
         &self,
         gate_handle: &cubecl::server::Handle,
         up_handle: &cubecl::server::Handle,
         len: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_silu_mul");
         let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             let threads = 64u32;
@@ -93,7 +210,7 @@ impl WgpuBackend {
 
     /// Launch RMSNorm: `out = (x / rms(x)) * weight`, reading `x` and
     /// `weight` directly from GPU handles — no CPU round-trip.
-    pub(crate) fn launch_rms_norm(
+    pub fn launch_rms_norm(
         &self,
         x_handle: &cubecl::server::Handle,
         weight_handle: &cubecl::server::Handle,
@@ -101,12 +218,13 @@ impl WgpuBackend {
         eps: f32,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_rms_norm");
         let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             crate::ops::kernels::wgpu::rms_norm::launch::<WgpuRuntime>(
                 &self.client,
                 CubeCount::Static(1, 1, 1),
-                CubeDim::new_1d(1),
+                CubeDim::new_1d(256),
                 ArrayArg::from_raw_parts(x_handle.clone(), len),
                 ArrayArg::from_raw_parts(weight_handle.clone(), len),
                 ArrayArg::from_raw_parts(out_handle.clone(), len),
@@ -119,7 +237,7 @@ impl WgpuBackend {
     /// Fused `new_x = x + delta` then `normed = norm(new_x)` — one dispatch
     /// instead of a separate residual-add + `launch_rms_norm` pair. Returns
     /// `(new_x_handle, normed_handle)`.
-    pub(crate) fn launch_add_residual_rms_norm(
+    pub fn launch_add_residual_rms_norm(
         &self,
         x_handle: &cubecl::server::Handle,
         delta_handle: &cubecl::server::Handle,
@@ -128,13 +246,14 @@ impl WgpuBackend {
         eps: f32,
     ) -> (cubecl::server::Handle, cubecl::server::Handle) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_add_residual_rms_norm");
         let new_x_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         let normed_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         unsafe {
             crate::ops::kernels::wgpu::add_residual_rms_norm::launch::<WgpuRuntime>(
                 &self.client,
                 CubeCount::Static(1, 1, 1),
-                CubeDim::new_1d(1),
+                CubeDim::new_1d(256),
                 ArrayArg::from_raw_parts(x_handle.clone(), len),
                 ArrayArg::from_raw_parts(delta_handle.clone(), len),
                 ArrayArg::from_raw_parts(weight_handle.clone(), len),
@@ -151,7 +270,7 @@ impl WgpuBackend {
     /// `in_proj` launch) and the layer's static conv weights, mutates
     /// the layer's persistent `history` handle in place, and returns
     /// the `conv_out` handle — no CPU round-trip.
-    pub(crate) fn launch_short_conv(
+    pub fn launch_short_conv(
         &self,
         bcx_handle: &cubecl::server::Handle,
         weight_handle: &cubecl::server::Handle,
@@ -160,6 +279,7 @@ impl WgpuBackend {
         d: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_short_conv");
         let out_handle = self.client.empty(d * crate::ops::ACT_SIZE);
         unsafe {
             let threads = 64u32;
@@ -181,7 +301,7 @@ impl WgpuBackend {
     /// Launch Q/K/V projections without reading the results back — the
     /// fully GPU-resident attention path keeps q/k/v as handles through
     /// RoPE, QK-norm, KV-cache write, and the attention kernel itself.
-    pub(crate) fn launch_qkv(
+    pub fn launch_qkv(
         &self,
         hq: &GpuWeightHandle,
         hk: &GpuWeightHandle,
@@ -192,6 +312,7 @@ impl WgpuBackend {
         cubecl::server::Handle,
         cubecl::server::Handle,
     ) {
+        let _timer = crate::ops::trace::Timer::new("launch_qkv");
         let q = self.launch_only(hq, x_handle);
         let k = self.launch_only(hk, x_handle);
         let v = self.launch_only(hv, x_handle);
@@ -202,7 +323,7 @@ impl WgpuBackend {
     /// buffer (`n_heads` heads of `head_dim` each). `n_rot` is the number of
     /// dims rotated per head (pass `head_dim` for full rotation, or fewer
     /// for Qwen3.5's `GatedAttention` partial RoPE).
-    pub(crate) fn launch_rope(
+    pub fn launch_rope(
         &self,
         handle: &cubecl::server::Handle,
         n_heads: usize,
@@ -212,6 +333,7 @@ impl WgpuBackend {
         theta: f32,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_rope");
         let total = n_heads * (n_rot / 2);
         let threads = 64u32;
         let workgroups = (total as u32 + threads - 1) / threads;
@@ -233,13 +355,14 @@ impl WgpuBackend {
     /// Deinterleave a fused `[Q(head_dim) | gate(head_dim)]`-per-head buffer
     /// (the output of Qwen3.5's `wqg` projection) into contiguous `q` and
     /// `gate` handles.
-    pub(crate) fn launch_split_qg(
+    pub fn launch_split_qg(
         &self,
         qg_raw_handle: &cubecl::server::Handle,
         head_dim: usize,
         n_heads: usize,
     ) -> (cubecl::server::Handle, cubecl::server::Handle) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_split_qg");
         let q_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
         let gate_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
         let threads = 64u32;
@@ -260,13 +383,14 @@ impl WgpuBackend {
 
     /// `out[i] = a[i] * sigmoid(b[i])`, both already GPU-resident — used for
     /// Qwen3.5's `GatedAttention` output gate (`attn_out *= sigmoid(gate)`).
-    pub(crate) fn launch_sigmoid_mul(
+    pub fn launch_sigmoid_mul(
         &self,
         a_handle: &cubecl::server::Handle,
         b_handle: &cubecl::server::Handle,
         len: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_sigmoid_mul");
         let out_handle = self.client.empty(len * crate::ops::ACT_SIZE);
         let threads = 64u32;
         let workgroups = (len as u32 + threads - 1) / threads;
@@ -287,7 +411,7 @@ impl WgpuBackend {
     /// by `launch_rope` — same math, one thread per head does the RMSNorm
     /// reduction then the rotation back to back.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn launch_qk_norm_rope(
+    pub fn launch_qk_norm_rope(
         &self,
         handle: &cubecl::server::Handle,
         weight_handle: &cubecl::server::Handle,
@@ -299,6 +423,7 @@ impl WgpuBackend {
         theta: f32,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_qk_norm_rope");
         let threads = 64u32;
         let workgroups = (n_heads as u32 + threads - 1) / threads;
         unsafe {
@@ -321,7 +446,7 @@ impl WgpuBackend {
     /// Append the current token's (already RoPE'd) K/V into the layer's
     /// persistent GPU-resident cache at slot `pos`. Mutates `k_cache`/
     /// `v_cache` in place.
-    pub(crate) fn launch_kv_cache_write(
+    pub fn launch_kv_cache_write(
         &self,
         k_cache: &cubecl::server::Handle,
         v_cache: &cubecl::server::Handle,
@@ -331,6 +456,7 @@ impl WgpuBackend {
         kv_dim: usize,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_kv_cache_write");
         let threads = 64u32;
         let workgroups = (kv_dim as u32 + threads - 1) / threads;
         unsafe {
@@ -352,7 +478,7 @@ impl WgpuBackend {
     /// `weights` are reused scratch buffers (`n_heads * max_seq` each).
     /// Three kernel launches in sequence: scores → softmax → output.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn launch_attention(
+    pub fn launch_attention(
         &self,
         q: &cubecl::server::Handle,
         k_cache: &cubecl::server::Handle,
@@ -366,6 +492,7 @@ impl WgpuBackend {
         max_seq: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_attention");
         let out_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
         let sums_handle = self.client.empty(n_heads * core::mem::size_of::<f32>());
         let threads = 64u32;
@@ -436,6 +563,13 @@ impl WgpuBackend {
         self.client.create_from_slice(f32::as_bytes(x))
     }
 
+    /// Import a plain f32 slice into a GPU handle. Used for benchmarking
+    /// input data that doesn't need to be packed as activations.
+    pub fn import_f32(&self, x: &[f32]) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        self.client.create_from_slice(f32::as_bytes(x))
+    }
+
     /// Upload a plain f32 vector to GPU as the activation storage type [`Act`]
     /// (f16 by default). Used for the actual activation stream — the embedding
     /// that seeds `x_handle`, and the KV-cache buffers the resident kernels
@@ -457,13 +591,14 @@ impl WgpuBackend {
     /// but takes and returns GPU handles with no readback at all — used by
     /// the fully GPU-resident forward pass to keep `down`'s output on GPU
     /// for a subsequent residual-add.
-    pub(crate) fn ffn_chain_from_handle(
+    pub fn ffn_chain_from_handle(
         &self,
         h_gate: &GpuWeightHandle,
         h_up: &GpuWeightHandle,
         h_down: &GpuWeightHandle,
         x_handle: &cubecl::server::Handle,
     ) -> cubecl::server::Handle {
+        let _timer = crate::ops::trace::Timer::new("ffn_chain");
         let gate_handle = self.launch_only(h_gate, x_handle);
         let up_handle = self.launch_only(h_up, x_handle);
         let act_handle = self.launch_silu_mul(&gate_handle, &up_handle, h_gate.out_dim);
@@ -474,7 +609,7 @@ impl WgpuBackend {
     /// offsets (Q range, K range), in place, in a single dispatch — Qwen3.5
     /// Gated DeltaNet's Q/K normalization (no learned weight, unlike
     /// `launch_qk_norm_rope`).
-    pub(crate) fn launch_l2_norm_heads(
+    pub fn launch_l2_norm_heads(
         &self,
         handle: &cubecl::server::Handle,
         base_offset: usize,
@@ -485,6 +620,7 @@ impl WgpuBackend {
         total_len: usize,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_l2_norm_heads");
         let threads = 64u32;
         let workgroups = ((2 * n_heads) as u32 + threads - 1) / threads;
         unsafe {
@@ -505,7 +641,7 @@ impl WgpuBackend {
     /// Gated DeltaNet's output gated-RMSNorm: `weight * norm(x[h]) *
     /// silu(gate[h])` per head, in place on `handle`. `weight` is
     /// `[head_dim]`, reused across all `n_heads` segments of `handle`/`gate`.
-    pub(crate) fn launch_gdn_gated_norm(
+    pub fn launch_gdn_gated_norm(
         &self,
         handle: &cubecl::server::Handle,
         weight_handle: &cubecl::server::Handle,
@@ -515,6 +651,7 @@ impl WgpuBackend {
         eps: f32,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_gdn_gated_norm");
         let total_len = n_heads * head_dim;
         let threads = 64u32;
         let workgroups = (n_heads as u32 + threads - 1) / threads;
@@ -536,7 +673,7 @@ impl WgpuBackend {
     /// Gated DeltaNet's `beta`/`decay` gate computation, in place on the
     /// layer's raw projection outputs. `ssm_a`/`dt_bias` are small static
     /// per-layer vectors uploaded once.
-    pub(crate) fn launch_gdn_gate_decay(
+    pub fn launch_gdn_gate_decay(
         &self,
         beta_raw_handle: &cubecl::server::Handle,
         alpha_raw_handle: &cubecl::server::Handle,
@@ -545,6 +682,7 @@ impl WgpuBackend {
         n_v_heads: usize,
     ) {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_gdn_gate_decay");
         let threads = 64u32;
         let workgroups = (n_v_heads as u32 + threads - 1) / threads;
         unsafe {
@@ -563,7 +701,7 @@ impl WgpuBackend {
     /// Gated DeltaNet's causal depthwise conv1d + SiLU, reading the raw
     /// `wqkv` projection output and mutating the layer's persistent
     /// `history` buffer in place. Returns the `conv_out` handle.
-    pub(crate) fn launch_causal_conv1d_silu(
+    pub fn launch_causal_conv1d_silu(
         &self,
         input_handle: &cubecl::server::Handle,
         weight_handle: &cubecl::server::Handle,
@@ -572,6 +710,7 @@ impl WgpuBackend {
         d_conv: usize,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_causal_conv1d_silu");
         let out_handle = self.client.empty(conv_dim * crate::ops::ACT_SIZE);
         let threads = 64u32;
         let workgroups = (conv_dim as u32 + threads - 1) / threads;
@@ -595,7 +734,7 @@ impl WgpuBackend {
     /// see the kernel doc comment). Mutates the layer's persistent
     /// `state` buffer in place and returns the `out` handle (`value_dim`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn launch_gdn_recurrence(
+    pub fn launch_gdn_recurrence(
         &self,
         state_handle: &cubecl::server::Handle,
         conv_out_handle: &cubecl::server::Handle,
@@ -610,6 +749,7 @@ impl WgpuBackend {
         scale: f32,
     ) -> cubecl::server::Handle {
         use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_gdn_recurrence");
         let value_dim = n_v_heads * head_v_dim;
         let out_handle = self.client.empty(value_dim * crate::ops::ACT_SIZE);
         unsafe {

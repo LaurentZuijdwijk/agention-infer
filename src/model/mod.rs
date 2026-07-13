@@ -480,6 +480,22 @@ pub trait Model: Send + Sync {
     fn vocab_size(&self) -> u64 {
         self.config().vocab_size
     }
+
+    /// Pre-upload all GPU-dequantizable weight tensors to GPU. Called once
+    /// after model creation, before first forward pass. Default is a no-op.
+    fn pre_upload_gpu(&mut self) {}
+
+    /// Compile the GPU matmul kernel up front (one dummy launch per dtype
+    /// actually present in this model's weights), so the ~7s shader compile
+    /// happens with a visible message at load time instead of silently
+    /// stalling on the model's first forward pass.
+    fn warmup_gpu_kernels(&self) {}
+
+    /// Returns true if the GPU-resident path is ready (all weights uploaded
+    /// and the GPU backend is available). Default is false.
+    fn gpu_resident_ready(&self) -> bool {
+        false
+    }
 }
 
 /// Simple KV cache using f32 storage.

@@ -236,6 +236,18 @@ impl<'a> LlamaModel<'a> {
     #[cfg(not(feature = "wgpu"))]
     pub fn warmup_gpu_kernels(&self) {}
 
+    /// Trait override: returns true if the GPU-resident path is ready.
+    #[cfg(feature = "wgpu")]
+    fn gpu_resident_ready(&self) -> bool {
+        self.gpu_resident_ready_backend().is_some()
+    }
+
+    /// Non-cfg version for non-wgpu builds.
+    #[cfg(not(feature = "wgpu"))]
+    fn gpu_resident_ready(&self) -> bool {
+        false
+    }
+
     /// Returns the GPU backend if every tensor this model needs (all layer
     /// weights — attention or short-conv — all norm vectors, lm_head) is
     /// GPU-resident — the preconditions for `run_gpu_resident`, which keeps
@@ -243,7 +255,7 @@ impl<'a> LlamaModel<'a> {
     /// crossing the CPU/GPU boundary once per matmul (see [[gpu-sync-bottleneck]]
     /// in project memory).
     #[cfg(feature = "wgpu")]
-    pub(crate) fn gpu_resident_ready(&self) -> Option<&crate::ops::wgpu_backend::WgpuBackend> {
+    pub fn gpu_resident_ready_backend(&self) -> Option<&crate::ops::wgpu_backend::WgpuBackend> {
         let Some(AnyBackend::Wgpu(b)) = &self.backend else {
             return None;
         };

@@ -69,29 +69,44 @@ pub fn split_qg(qg_raw: &Array<Act>, q: &mut Array<Act>, gate: &mut Array<Act>, 
 
 // ── RMSNorm: out[i] = (x[i] / rms) * weight[i] ────────────────────────────
 //
-// Single-threaded on purpose: at these vector sizes (embedding_length, a few
-// thousand elements) actual GPU compute time is negligible compared to the
-// fixed per-launch sync cost (see gpu-sync-bottleneck memory) — a parallel
-// reduction would add complexity without a measurable win.
+// Parallel over `RMSNORM_THREADS` lanes in one workgroup: each lane reduces a
+// strided slice of `x` into a partial sum-of-squares, a shared-memory tree
+// reduction produces the total, then each lane writes its slice of `out`. The
+// earlier single-threaded version (one lane serially scanning `x` twice) was
+// measured at ~0.5ms per call on d=4096 — more than a full d×ff matmul — and
+// dominated decode (2 norms/layer). See `bin/kernel_bench`.
 
 #[cube(launch)]
 pub fn rms_norm(x: &Array<Act>, weight: &Array<f32>, out: &mut Array<Act>, eps: f32) {
-    if ABSOLUTE_POS != 0 {
-        terminate!();
-    }
+    let lane = UNIT_POS as usize;
+    let nthreads = CUBE_DIM as usize;
     let n = x.len();
-    let mut sum_sq = 0.0f32;
-    let mut i = 0usize;
+
+    let mut partial = 0.0f32;
+    let mut i = lane;
     while i < n {
         let xi = f32::cast_from(x[i]);
-        sum_sq += xi * xi;
-        i += 1;
+        partial += xi * xi;
+        i += nthreads;
     }
-    let rms = f32::sqrt(sum_sq / (n as f32) + eps);
-    let mut j = 0usize;
+
+    let mut smem = SharedMemory::<f32>::new(256usize);
+    smem[lane] = partial;
+    sync_cube();
+    let mut stride = nthreads / 2;
+    while stride >= 1 {
+        if lane < stride {
+            smem[lane] += smem[lane + stride];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let rms = f32::sqrt(smem[0] / (n as f32) + eps);
+
+    let mut j = lane;
     while j < n {
         out[j] = Act::cast_from((f32::cast_from(x[j]) / rms) * weight[j]);
-        j += 1;
+        j += nthreads;
     }
 }
 
@@ -100,7 +115,10 @@ pub fn rms_norm(x: &Array<Act>, weight: &Array<f32>, out: &mut Array<Act>, eps: 
 // Every `residual_add` in the resident forward pass is immediately followed
 // by an `rms_norm` on its result (the next mixer's or FFN's prenorm, or the
 // final output norm) — folding them into one launch halves the dispatch
-// count for this pair. Single-threaded, same rationale as `rms_norm` above.
+// count for this pair. Parallel tree reduction, same as `rms_norm` above.
+// Each lane writes its slice of `new_x` in phase 1 and re-reads only that same
+// slice in phase 2, so no cross-lane sync is needed for `new_x` (only the
+// reduction syncs).
 
 #[cube(launch)]
 pub fn add_residual_rms_norm(
@@ -111,23 +129,36 @@ pub fn add_residual_rms_norm(
     normed: &mut Array<Act>,
     eps: f32,
 ) {
-    if ABSOLUTE_POS != 0 {
-        terminate!();
-    }
+    let lane = UNIT_POS as usize;
+    let nthreads = CUBE_DIM as usize;
     let n = x.len();
-    let mut sum_sq = 0.0f32;
-    let mut i = 0usize;
+
+    let mut partial = 0.0f32;
+    let mut i = lane;
     while i < n {
         let v = f32::cast_from(x[i]) + f32::cast_from(delta[i]);
         new_x[i] = Act::cast_from(v);
-        sum_sq += v * v;
-        i += 1;
+        partial += v * v;
+        i += nthreads;
     }
-    let rms = f32::sqrt(sum_sq / (n as f32) + eps);
-    let mut j = 0usize;
+
+    let mut smem = SharedMemory::<f32>::new(256usize);
+    smem[lane] = partial;
+    sync_cube();
+    let mut stride = nthreads / 2;
+    while stride >= 1 {
+        if lane < stride {
+            smem[lane] += smem[lane + stride];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let rms = f32::sqrt(smem[0] / (n as f32) + eps);
+
+    let mut j = lane;
     while j < n {
         normed[j] = Act::cast_from((f32::cast_from(new_x[j]) / rms) * weight[j]);
-        j += 1;
+        j += nthreads;
     }
 }
 
@@ -735,13 +766,13 @@ pub fn matmul_dequant_wgpu(
 
     let mut partial = 0.0f32;
     if dtype == DEQUANT_Q8_0 {
-        partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q4_K {
-        partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q5_K {
-        partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q6_K {
-        partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s, 0);
     }
 
     // Tree reduction: 64 → 32 → 16 → 8 → 4 → 2 → 1
@@ -797,13 +828,13 @@ pub fn matmul_dequant_wgpu_f32out(
 
     let mut partial = 0.0f32;
     if dtype == DEQUANT_Q8_0 {
-        partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q4_K {
-        partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q5_K {
-        partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s, 0);
     } else if dtype == DEQUANT_Q6_K {
-        partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s);
+        partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s, 0);
     }
 
     let mut smem = SharedMemory::<f32>::new(64usize);
@@ -834,6 +865,273 @@ pub fn matmul_dequant_wgpu_f32out(
     }
 }
 
+// ── Batched matmul (prefill) ──────────────────────────────────────────────
+//
+// One workgroup per **output row** — exactly the decode shape (do NOT reduce
+// the workgroup count; see PERFORMANCE_RECOMMENDATIONS "dispatch cost"). The
+// batch of `n` token activations is looped **inside** the workgroup: for each
+// token `t`, the same weight row `w[row]` is re-read and dotted against that
+// token's `x` slice. Because all `n` reads of `w[row]` happen back-to-back in
+// one workgroup, the row is streamed from VRAM once and served from L1 for
+// `t=1..n` — so the whole weight tensor is read once per matmul instead of
+// once per token, which is the batched-prefill win. `x` is `[n, in_dim]` and
+// `out` is `[n, out_dim]`, both token-major.
+#[cube(launch)]
+pub fn matmul_dequant_wgpu_batch(
+    w: &Array<u32>,
+    x: &Array<Act>,
+    out: &mut Array<Act>,
+    dtype: u32,
+    in_dim: usize,
+    out_dim: usize,
+    n: usize,
+    row_u32s: usize,
+    grid_x: u32,
+) {
+    let row = (CUBE_POS_Y * grid_x + CUBE_POS_X) as usize;
+    let lane = UNIT_POS as usize;
+    if row >= out_dim {
+        terminate!();
+    }
+
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    let mut t = 0usize;
+    while t < n {
+        let x_base = t * in_dim;
+        let mut partial = 0.0f32;
+        if dtype == DEQUANT_Q8_0 {
+            partial = partial_q8_0(w, x, row, lane, in_dim, row_u32s, x_base);
+        } else if dtype == DEQUANT_Q4_K {
+            partial = partial_q4_k(w, x, row, lane, in_dim, row_u32s, x_base);
+        } else if dtype == DEQUANT_Q5_K {
+            partial = partial_q5_k(w, x, row, lane, in_dim, row_u32s, x_base);
+        } else if dtype == DEQUANT_Q6_K {
+            partial = partial_q6_k(w, x, row, lane, in_dim, row_u32s, x_base);
+        }
+
+        smem[lane] = partial;
+        sync_cube();
+        if lane < 32 {
+            smem[lane] += smem[lane + 32];
+        }
+        sync_cube();
+        if lane < 16 {
+            smem[lane] += smem[lane + 16];
+        }
+        sync_cube();
+        if lane < 8 {
+            smem[lane] += smem[lane + 8];
+        }
+        sync_cube();
+        if lane < 4 {
+            smem[lane] += smem[lane + 4];
+        }
+        sync_cube();
+        if lane < 2 {
+            smem[lane] += smem[lane + 2];
+        }
+        sync_cube();
+        if lane == 0 {
+            out[t * out_dim + row] = Act::cast_from(smem[0] + smem[1]);
+        }
+        sync_cube();
+        t += 1;
+    }
+}
+
+// ── Cooperative batched matmul (Q8_0) — dequant-once test ─────────────────
+//
+// Hypothesis under test: the loop-N batched matmul above doesn't amortize
+// because the cost is dequant-COMPUTE-bound (each token iteration re-unpacks
+// the weight row), not weight-VRAM-bound. This kernel dequantizes the whole
+// weight row into shared memory ONCE (cooperatively across the 64 lanes), then
+// dots it against all `n` token activations — so the expensive dequant is paid
+// once and the `n` dots are cheap FMAs from LDS. If batched/tok drops with N
+// here (but not above), the cost was dequant-bound and batched prefill is worth
+// building on this kernel. Limited to `in_dim <= COOP_MAX` (LDS budget).
+#[cube(launch)]
+pub fn matmul_q8_0_coop_batch(
+    w: &Array<u32>,
+    x: &Array<Act>,
+    out: &mut Array<Act>,
+    in_dim: usize,
+    out_dim: usize,
+    n: usize,
+    row_u32s: usize,
+    grid_x: u32,
+) {
+    let row = (CUBE_POS_Y * grid_x + CUBE_POS_X) as usize;
+    let lane = UNIT_POS as usize;
+    if row >= out_dim {
+        terminate!();
+    }
+
+    // Dequantized weight row (f32) lives in LDS, shared by all n token dots.
+    let mut wrow = SharedMemory::<f32>::new(4096usize);
+    let mut red = SharedMemory::<f32>::new(64usize);
+
+    // Cooperative dequant: lane owns Q8_0 blocks lane, lane+64, … (stride 64).
+    let w_byte_base = row * row_u32s * 4;
+    let n_blocks = (in_dim + 31) / 32;
+    let mut b = lane;
+    while b < n_blocks {
+        let byte_off = w_byte_base + b * 34;
+        let scale = read_f16(w, byte_off);
+        let block_start = b * 32;
+        let mut i = 0usize;
+        while i < 32 {
+            let idx = block_start + i;
+            if idx < in_dim {
+                let q = read_i8_i32(w, byte_off + 2 + i) as f32;
+                wrow[idx] = scale * q;
+            }
+            i += 1;
+        }
+        b += 64;
+    }
+    sync_cube();
+
+    // One dot per token, reusing the dequantized row from LDS.
+    let mut t = 0usize;
+    while t < n {
+        let x_base = t * in_dim;
+        let mut acc = 0.0f32;
+        let mut j = lane;
+        while j < in_dim {
+            acc += wrow[j] * f32::cast_from(x[x_base + j]);
+            j += 64;
+        }
+        red[lane] = acc;
+        sync_cube();
+        if lane < 32 {
+            red[lane] += red[lane + 32];
+        }
+        sync_cube();
+        if lane < 16 {
+            red[lane] += red[lane + 16];
+        }
+        sync_cube();
+        if lane < 8 {
+            red[lane] += red[lane + 8];
+        }
+        sync_cube();
+        if lane < 4 {
+            red[lane] += red[lane + 4];
+        }
+        sync_cube();
+        if lane < 2 {
+            red[lane] += red[lane + 2];
+        }
+        sync_cube();
+        if lane == 0 {
+            out[t * out_dim + row] = Act::cast_from(red[0] + red[1]);
+        }
+        sync_cube();
+        t += 1;
+    }
+}
+
+// Cooperative batched matmul (Q4_K) — same dequant-once scheme as the Q8_0
+// version, using Q4_K super-block unpacking (see `partial_q4_k`). `in_dim <=
+// 4096`.
+#[cube(launch)]
+pub fn matmul_q4_k_coop_batch(
+    w: &Array<u32>,
+    x: &Array<Act>,
+    out: &mut Array<Act>,
+    in_dim: usize,
+    out_dim: usize,
+    n: usize,
+    row_u32s: usize,
+    grid_x: u32,
+) {
+    let row = (CUBE_POS_Y * grid_x + CUBE_POS_X) as usize;
+    let lane = UNIT_POS as usize;
+    if row >= out_dim {
+        terminate!();
+    }
+
+    let mut wrow = SharedMemory::<f32>::new(4096usize);
+    let mut red = SharedMemory::<f32>::new(64usize);
+
+    // Cooperative dequant: lane owns sub-units lane, lane+64, … (stride 64).
+    let w_byte_base = row * row_u32s * 4;
+    let n_blocks = ((in_dim as u32) + 255u32) / 256u32;
+    let n_units = (n_blocks * 8u32) as usize;
+    let mut u = lane;
+    while u < n_units {
+        let block = (u / 8) as u32;
+        let is = (u % 8) as u32;
+        let group = is / 2u32;
+
+        let byte_off = w_byte_base + (block * 144u32) as usize;
+        let d = read_f16(w, byte_off);
+        let dmin = read_f16(w, byte_off + 2);
+        let (sc, m) = get_scale_min_k4_u32(is, w, byte_off + 4);
+        let d_sc = d * (sc as f32);
+        let dmin_m = dmin * (m as f32);
+
+        let qs_byte_off = byte_off + 16 + (group * 32u32) as usize;
+        let group_val_base = block * 256u32 + group * 64u32;
+        let low = is % 2u32 == 0u32;
+
+        let mut l = 0usize;
+        while l < 32 {
+            let idx = if low {
+                group_val_base as usize + l
+            } else {
+                group_val_base as usize + 32 + l
+            };
+            if idx < in_dim {
+                let qb = read_byte_u32(w, qs_byte_off + l);
+                let nibble = if low { qb & 0xFu32 } else { (qb >> 4u32) & 0xFu32 };
+                wrow[idx] = d_sc * (nibble as f32) - dmin_m;
+            }
+            l += 1;
+        }
+        u += 64;
+    }
+    sync_cube();
+
+    let mut t = 0usize;
+    while t < n {
+        let x_base = t * in_dim;
+        let mut acc = 0.0f32;
+        let mut j = lane;
+        while j < in_dim {
+            acc += wrow[j] * f32::cast_from(x[x_base + j]);
+            j += 64;
+        }
+        red[lane] = acc;
+        sync_cube();
+        if lane < 32 {
+            red[lane] += red[lane + 32];
+        }
+        sync_cube();
+        if lane < 16 {
+            red[lane] += red[lane + 16];
+        }
+        sync_cube();
+        if lane < 8 {
+            red[lane] += red[lane + 8];
+        }
+        sync_cube();
+        if lane < 4 {
+            red[lane] += red[lane + 4];
+        }
+        sync_cube();
+        if lane < 2 {
+            red[lane] += red[lane + 2];
+        }
+        sync_cube();
+        if lane == 0 {
+            out[t * out_dim + row] = Act::cast_from(red[0] + red[1]);
+        }
+        sync_cube();
+        t += 1;
+    }
+}
+
 // ── Q8_0 partial ─────────────────────────────────────────────────────────
 //
 // Thread `lane` owns blocks lane, lane+64, lane+128, … (stride 64).
@@ -847,6 +1145,7 @@ fn partial_q8_0(
     lane: usize,
     in_dim: usize,
     row_u32s: usize,
+    x_base: usize,
 ) -> f32 {
     let w_byte_base = row * row_u32s * 4;
     let n_blocks = (in_dim + 31) / 32;
@@ -862,7 +1161,7 @@ fn partial_q8_0(
             let idx = block_start + i;
             if idx < in_dim {
                 let q = read_i8_i32(w, byte_off + 2 + i) as f32;
-                dot += q * f32::cast_from(x[idx]);
+                dot += q * f32::cast_from(x[x_base + idx]);
             }
             i += 1;
         }
@@ -887,6 +1186,7 @@ fn partial_q4_k(
     lane: usize,
     in_dim: usize,
     row_u32s: usize,
+    x_base: usize,
 ) -> f32 {
     let w_byte_base = row * row_u32s * 4;
     let n_blocks = ((in_dim as u32) + 255u32) / 256u32;
@@ -927,7 +1227,7 @@ fn partial_q4_k(
             if idx < in_dim {
                 let qb = read_byte_u32(w, qs_byte_off + l);
                 let nibble = if low { qb & 0xFu32 } else { (qb >> 4u32) & 0xFu32 };
-                sum += (d_sc * (nibble as f32) - dmin_m) * f32::cast_from(x[idx]);
+                sum += (d_sc * (nibble as f32) - dmin_m) * f32::cast_from(x[x_base + idx]);
             }
             l += 1;
         }
@@ -952,6 +1252,7 @@ fn partial_q5_k(
     lane: usize,
     in_dim: usize,
     row_u32s: usize,
+    x_base: usize,
 ) -> f32 {
     let w_byte_base = row * row_u32s * 4;
     let n_blocks = ((in_dim as u32) + 255u32) / 256u32;
@@ -992,7 +1293,7 @@ fn partial_q5_k(
                     let hb = (qh_word >> shift) & 0xFFu32;
                     let hi_bit = (hb >> is) & 1u32;
                     let quant = nibble | (hi_bit << 4u32);
-                    sum += (d_sc * (quant as f32) - dmin_m) * f32::cast_from(x[idx]);
+                    sum += (d_sc * (quant as f32) - dmin_m) * f32::cast_from(x[x_base + idx]);
                 }
                 sub += 1;
             }
@@ -1018,6 +1319,7 @@ fn partial_q6_k(
     lane: usize,
     in_dim: usize,
     row_u32s: usize,
+    x_base: usize,
 ) -> f32 {
     let w_byte_base = row * row_u32s * 4;
     let n_blocks = (in_dim + 255) / 256;
@@ -1052,19 +1354,19 @@ fn partial_q6_k(
 
         let idx0 = y_off + l;
         if idx0 < in_dim {
-            sum += d * sc0 * (q1 as f32) * f32::cast_from(x[idx0]);
+            sum += d * sc0 * (q1 as f32) * f32::cast_from(x[x_base + idx0]);
         }
         let idx1 = idx0 + 32;
         if idx1 < in_dim {
-            sum += d * sc2 * (q2 as f32) * f32::cast_from(x[idx1]);
+            sum += d * sc2 * (q2 as f32) * f32::cast_from(x[x_base + idx1]);
         }
         let idx2 = idx0 + 64;
         if idx2 < in_dim {
-            sum += d * sc4 * (q3 as f32) * f32::cast_from(x[idx2]);
+            sum += d * sc4 * (q3 as f32) * f32::cast_from(x[x_base + idx2]);
         }
         let idx3 = idx0 + 96;
         if idx3 < in_dim {
-            sum += d * sc6 * (q4 as f32) * f32::cast_from(x[idx3]);
+            sum += d * sc6 * (q4 as f32) * f32::cast_from(x[x_base + idx3]);
         }
 
         block += 1;

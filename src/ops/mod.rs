@@ -5,6 +5,8 @@ pub mod kernels_u8;
 pub mod kernels_wgpu;
 
 mod backend_select;
+#[cfg(feature = "wgpu")]
+pub mod trace;
 #[cfg(feature = "cpu")]
 pub mod cpu_backend;
 #[cfg(feature = "wgpu")]

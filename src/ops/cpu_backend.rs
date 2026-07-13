@@ -44,6 +44,7 @@ impl Backend for CpuBackend {
     ) -> Result<()> {
         // CPU path: use the existing pure-Rust fused dequant+dot kernels.
         // These are already correct and fast on CPU via rayon.
+        let _timer = crate::ops::trace::Timer::new("matmul_dequant_cpu");
         let row_bytes = dtype.type_size(x.len());
 
         for (row_idx, o) in out.iter_mut().enumerate() {

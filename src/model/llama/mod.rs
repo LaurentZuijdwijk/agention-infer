@@ -336,13 +336,13 @@ impl<'a> Model for LlamaModel<'a> {
             .expect("InferenceState missing (forward is not re-entrant)");
 
         #[cfg(feature = "wgpu")]
-        let result = if self.gpu_resident_ready().is_some() {
+        let result = if self.gpu_resident_ready_backend().is_some() {
             // `max_seq_len` isn't known until the caller builds its
             // `KvCache`, so the GPU-resident KV cache is allocated lazily
             // here rather than in `pre_upload_gpu`.
             self.ensure_gpu_kv_cache(kv_cache.max_seq_len());
             let b = self
-                .gpu_resident_ready()
+                .gpu_resident_ready_backend()
                 .expect("checked Some(_) above; backend/model didn't change in between");
             self.run_gpu_resident(b, token, pos)
         } else {
@@ -371,10 +371,10 @@ impl<'a> Model for LlamaModel<'a> {
             .expect("InferenceState missing (forward_batch is not re-entrant)");
 
         #[cfg(feature = "wgpu")]
-        let result = if self.gpu_resident_ready().is_some() {
+        let result = if self.gpu_resident_ready_backend().is_some() {
             self.ensure_gpu_kv_cache(kv_cache.max_seq_len());
             let b = self
-                .gpu_resident_ready()
+                .gpu_resident_ready_backend()
                 .expect("checked Some(_) above; backend/model didn't change in between");
             // Stage 3 will batch these dispatches; for now a correct
             // per-position loop keeps the GPU path identical to sequential

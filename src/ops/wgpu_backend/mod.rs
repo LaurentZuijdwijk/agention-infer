@@ -4,7 +4,7 @@
 //! `matmul_dequant_ffn`). See `resident.rs` for the GPU-resident `launch_*`
 //! helpers used by the fully-resident forward pass.
 
-mod resident;
+pub mod resident;
 
 use super::Backend;
 use crate::error::Result;
@@ -24,7 +24,7 @@ fn trace_matmul_enabled() -> bool {
 }
 
 pub struct WgpuBackend {
-    client: ComputeClient<WgpuRuntime>,
+    pub client: ComputeClient<WgpuRuntime>,
 }
 
 impl WgpuBackend {
@@ -89,6 +89,144 @@ impl WgpuBackend {
             out_dim,
             row_u32s,
         }
+    }
+
+    /// Micro-benchmark: does the batched matmul actually read the weight tensor
+    /// once (L1-amortized) instead of `n` times? Times `iters` rounds of (a) `n`
+    /// separate single-token `launch_only` calls vs (b) one `launch_only_batch`,
+    /// for the same `[n, in_dim]` input against weight `h`. Returns
+    /// `(single_secs, batch_secs)` totals. Each round is forced to completion
+    /// with a readback so the timing is real. Used by `bin/matmul_batch_bench`.
+    /// Returns `(single_secs, loopN_secs, coop_secs, coop_max_abs_err)`. The
+    /// coop path is Q8_0-only with `in_dim <= 4096`; pass such a tensor. The
+    /// err compares coop's token-0 output against the single-token matmul.
+    pub fn probe_batched_matmul(
+        &self,
+        h: &GpuWeightHandle,
+        n: usize,
+        iters: usize,
+    ) -> (f64, f64, f64, f32) {
+        use cubecl::prelude::*;
+        use std::time::Instant;
+
+        let x = vec![1.0f32; n * h.in_dim];
+        let x_batch = self.upload_act(&x);
+        // A single-token x handle (first token's slice) reused for the n separate
+        // launches — same weight-read pattern as n independent matmuls.
+        let x_one = self.upload_act(&x[..h.in_dim]);
+
+        // Warm up all paths (compile kernels, prime caches).
+        for _ in 0..2 {
+            let o = self.launch_only(h, &x_one);
+            let _ = self.client.read_one_unchecked(o);
+            let o = self.launch_only_batch(h, &x_batch, n);
+            let _ = self.client.read_one_unchecked(o);
+            let o = self.launch_coop_batch(h, &x_batch, n);
+            let _ = self.client.read_one_unchecked(o);
+        }
+
+        // Correctness: coop token-0 vs single (both dot dequant(W) · ones).
+        let ref_bytes = {
+            let o = self.launch_only(h, &x_one);
+            self.client.read_one_unchecked(o)
+        };
+        let coop_bytes = {
+            let o = self.launch_coop_batch(h, &x_batch, n);
+            self.client.read_one_unchecked(o)
+        };
+        let refv = crate::ops::act_decode(&ref_bytes, h.out_dim);
+        let coopv = crate::ops::act_decode(&coop_bytes, h.out_dim);
+        let max_abs_err = refv
+            .iter()
+            .zip(&coopv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut last = None;
+            for _ in 0..n {
+                last = Some(self.launch_only(h, &x_one));
+            }
+            let _ = self.client.read_one_unchecked(last.unwrap());
+        }
+        let single_secs = t0.elapsed().as_secs_f64();
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let o = self.launch_only_batch(h, &x_batch, n);
+            let _ = self.client.read_one_unchecked(o);
+        }
+        let batch_secs = t0.elapsed().as_secs_f64();
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let o = self.launch_coop_batch(h, &x_batch, n);
+            let _ = self.client.read_one_unchecked(o);
+        }
+        let coop_secs = t0.elapsed().as_secs_f64();
+
+        (single_secs, batch_secs, coop_secs, max_abs_err)
+    }
+
+    /// Micro-benchmark the amortized per-dispatch cost of the resident-path
+    /// kernels, to test whether decode is dispatch-count-bound (in which case
+    /// every kernel costs ~the same dispatch floor regardless of work, and
+    /// fusion is the lever) vs compute-bound (kernels differ by their work).
+    ///
+    /// Each kernel is launched `k` times back-to-back with a single sync at the
+    /// end (mirroring the real forward's batched submission), so the reported
+    /// per-launch time is the *amortized, pipelined* cost — not the isolated
+    /// sync-inflated cost. Prints a table. `h` is a real weight tensor (matmul);
+    /// `d` = embedding_length, `ff` = feed_forward_length.
+    pub fn probe_kernel_costs(&self, h: &GpuWeightHandle, d: usize, ff: usize, k: usize) {
+        use std::time::Instant;
+
+        // Inputs.
+        let x_in = self.upload_act(&vec![1.0f32; h.in_dim]);
+        let x_d = self.upload_act(&vec![1.0f32; d]);
+        let w_d = self.upload_activation(&vec![1.0f32; d]);
+        let g_ff = self.upload_act(&vec![1.0f32; ff]);
+        let u_ff = self.upload_act(&vec![1.0f32; ff]);
+        let tiny = self.upload_act(&vec![1.0f32; 64]);
+        let tiny2 = self.upload_act(&vec![1.0f32; 64]);
+
+        // (label, closure returning a handle to sync on).
+        let mut rows: Vec<(&str, f64)> = Vec::new();
+        macro_rules! bench {
+            ($label:expr, $body:expr) => {{
+                for _ in 0..3 {
+                    let o = $body;
+                    let _ = self.client.read_one_unchecked(o);
+                }
+                let t0 = Instant::now();
+                let mut last = None;
+                for _ in 0..k {
+                    last = Some($body);
+                }
+                let _ = self.client.read_one_unchecked(last.unwrap());
+                rows.push(($label, t0.elapsed().as_secs_f64() / k as f64 * 1e3));
+            }};
+        }
+
+        bench!("dispatch_floor(silu len64)", self.launch_silu_mul(&tiny, &tiny2, 64));
+        bench!("matmul (in_dim x out_dim)", self.launch_only(h, &x_in));
+        bench!("rms_norm(d) [1-thread]", self.launch_rms_norm(&x_d, &w_d, d, 1e-5));
+        bench!(
+            "add_resid_rms_norm(d) [1-thread]",
+            { let (_n, r) = self.launch_add_residual_rms_norm(&x_d, &x_d, &w_d, d, 1e-5); r }
+        );
+        bench!("silu_mul(ff)", self.launch_silu_mul(&g_ff, &u_ff, ff));
+
+        println!("\n{:>36}  {:>12}", "kernel", "ms/dispatch");
+        for (label, ms) in &rows {
+            println!("{label:>36}  {ms:>12.4}");
+        }
+        let floor = rows[0].1;
+        println!(
+            "\nfloor = {floor:.4} ms/dispatch. If every kernel ≈ floor, decode is\n\
+             dispatch-count-bound → fusion (fewer dispatches) is the lever, not faster kernels."
+        );
     }
 
     /// Launch the consolidated dequant matmul using a pre-uploaded weight tensor.
@@ -238,6 +376,7 @@ impl WgpuBackend {
         use std::time::Instant;
         debug_assert_eq!(hs.len(), outs.len());
         let trace = trace_matmul_enabled();
+        let _timer = crate::ops::trace::Timer::new("matmul_dequant_multi");
 
         let t0 = Instant::now();
         let handles: Vec<_> = hs.iter().map(|h| self.launch_only_f32out(h, &x_handle)).collect();
@@ -337,6 +476,11 @@ pub struct GpuWeightHandle {
 }
 
 impl GpuWeightHandle {
+    /// Returns the underlying GPU handle for benchmarking.
+    pub fn handle_ref(&self) -> &cubecl::server::Handle {
+        &self.handle
+    }
+
     /// The dtype and in_dim this handle was uploaded with — used by
     /// warmup to know which kernel variants to pre-compile.
     pub fn shape(&self) -> (GgmlType, usize) {
