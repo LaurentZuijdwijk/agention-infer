@@ -424,13 +424,12 @@ impl WgpuBackend {
     ) {
         use cubecl::prelude::*;
         let _timer = crate::ops::trace::Timer::new("launch_qk_norm_rope");
-        let threads = 64u32;
-        let workgroups = (n_heads as u32 + threads - 1) / threads;
+        // One workgroup per head, 64 cooperating lanes (see kernel).
         unsafe {
             crate::ops::kernels::wgpu::qk_norm_rope::launch::<WgpuRuntime>(
                 &self.client,
-                CubeCount::Static(workgroups, 1, 1),
-                CubeDim::new_1d(threads),
+                CubeCount::Static(n_heads as u32, 1, 1),
+                CubeDim::new_1d(64),
                 ArrayArg::from_raw_parts(handle.clone(), n_heads * head_dim),
                 ArrayArg::from_raw_parts(weight_handle.clone(), head_dim),
                 n_heads,
@@ -621,13 +620,12 @@ impl WgpuBackend {
     ) {
         use cubecl::prelude::*;
         let _timer = crate::ops::trace::Timer::new("launch_l2_norm_heads");
-        let threads = 64u32;
-        let workgroups = ((2 * n_heads) as u32 + threads - 1) / threads;
+        // One workgroup per segment (2*n_heads), 64 cooperating lanes.
         unsafe {
             crate::ops::kernels::wgpu::l2_norm_heads::launch::<WgpuRuntime>(
                 &self.client,
-                CubeCount::Static(workgroups, 1, 1),
-                CubeDim::new_1d(threads),
+                CubeCount::Static((2 * n_heads) as u32, 1, 1),
+                CubeDim::new_1d(64),
                 ArrayArg::from_raw_parts(handle.clone(), total_len),
                 base_offset,
                 base_offset2,
@@ -653,13 +651,12 @@ impl WgpuBackend {
         use cubecl::prelude::*;
         let _timer = crate::ops::trace::Timer::new("launch_gdn_gated_norm");
         let total_len = n_heads * head_dim;
-        let threads = 64u32;
-        let workgroups = (n_heads as u32 + threads - 1) / threads;
+        // One workgroup per head, 64 cooperating lanes.
         unsafe {
             crate::ops::kernels::wgpu::gdn_gated_rms_norm::launch::<WgpuRuntime>(
                 &self.client,
-                CubeCount::Static(workgroups, 1, 1),
-                CubeDim::new_1d(threads),
+                CubeCount::Static(n_heads as u32, 1, 1),
+                CubeDim::new_1d(64),
                 ArrayArg::from_raw_parts(handle.clone(), total_len),
                 ArrayArg::from_raw_parts(weight_handle.clone(), head_dim),
                 ArrayArg::from_raw_parts(gate_handle.clone(), total_len),

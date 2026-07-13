@@ -244,10 +244,14 @@ pub fn rope(x: &mut Array<Act>, n_heads: usize, head_dim: usize, n_rot: usize, p
     x[start + d + half] = Act::cast_from(x0 * sin_val + x1 * cos_val);
 }
 
-// ── Fused QK-norm + RoPE: one thread per head does the RMSNorm reduction ──
-// then the rotation, back to back — one kernel launch (and one `sync`-cost
-// round trip) instead of two. `n_rot` may be less than `head_dim` (Qwen3.5's
-// `GatedAttention` layers only rotate the first `n_rot` dims).
+// ── Fused QK-norm + RoPE ──────────────────────────────────────────────────
+// One workgroup per head, 64 lanes cooperating: a shared-memory reduction for
+// the per-head RMSNorm, then the normalize and the rotation are spread across
+// lanes (each lane owns a strided slice). The earlier one-thread-per-head
+// version serialized the head_dim reduction AND every per-dim `powf/sin/cos`
+// in a single thread — measured ~0.09ms/call (13× the dispatch floor), 2× per
+// attention layer. `n_rot` may be < `head_dim` (Qwen3.5 `GatedAttention`).
+// Launch with `CubeCount(n_heads, 1, 1)`, `CubeDim(64)`.
 
 #[cube(launch)]
 pub fn qk_norm_rope(
@@ -260,29 +264,46 @@ pub fn qk_norm_rope(
     pos: usize,
     theta: f32,
 ) {
-    let h = ABSOLUTE_POS;
+    let h = CUBE_POS_X as usize;
+    let lane = UNIT_POS as usize;
+    let nlanes = CUBE_DIM as usize;
     if h >= n_heads {
         terminate!();
     }
     let start = h * head_dim;
 
-    let mut sum_sq = 0.0f32;
-    let mut d = 0usize;
+    // Per-head sum-of-squares (cooperative) → rms.
+    let mut partial = 0.0f32;
+    let mut d = lane;
     while d < head_dim {
         let v = f32::cast_from(x[start + d]);
-        sum_sq += v * v;
-        d += 1;
+        partial += v * v;
+        d += nlanes;
     }
-    let rms = f32::sqrt(sum_sq / (head_dim as f32) + eps);
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    smem[lane] = partial;
+    sync_cube();
+    let mut stride = nlanes / 2;
+    while stride >= 1 {
+        if lane < stride {
+            smem[lane] += smem[lane + stride];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let rms = f32::sqrt(smem[0] / (head_dim as f32) + eps);
 
-    let mut d2 = 0usize;
+    // Normalize this head's slice (cooperative), then make it visible to all
+    // lanes before RoPE reads across the `half` boundary.
+    let mut d2 = lane;
     while d2 < head_dim {
         x[start + d2] = Act::cast_from(weight[d2] * f32::cast_from(x[start + d2]) / rms);
-        d2 += 1;
+        d2 += nlanes;
     }
+    sync_cube();
 
     let half = n_rot / 2;
-    let mut d3 = 0usize;
+    let mut d3 = lane;
     while d3 < half {
         let exponent = 2.0f32 * (d3 as f32) / (n_rot as f32);
         let freq = (pos as f32) / f32::powf(theta, exponent);
@@ -292,7 +313,7 @@ pub fn qk_norm_rope(
         let x1 = f32::cast_from(x[start + d3 + half]);
         x[start + d3] = Act::cast_from(x0 * cos_val - x1 * sin_val);
         x[start + d3 + half] = Act::cast_from(x0 * sin_val + x1 * cos_val);
-        d3 += 1;
+        d3 += nlanes;
     }
 }
 
@@ -304,6 +325,9 @@ pub fn qk_norm_rope(
 // (`base_offset`), the second half the K range (`base_offset2`), fusing what
 // would otherwise be two separate dispatches into one.
 
+// One workgroup per segment (`2*n_heads` total), 64 cooperating lanes — was one
+// thread per head serially reducing `head_dim`. Launch `CubeCount(2*n_heads)`,
+// `CubeDim(64)`.
 #[cube(launch)]
 pub fn l2_norm_heads(
     x: &mut Array<Act>,
@@ -313,27 +337,40 @@ pub fn l2_norm_heads(
     head_dim: usize,
     eps: f32,
 ) {
-    let idx = ABSOLUTE_POS;
-    if idx >= 2 * n_heads {
+    let seg = CUBE_POS_X as usize;
+    let lane = UNIT_POS as usize;
+    let nlanes = CUBE_DIM as usize;
+    if seg >= 2 * n_heads {
         terminate!();
     }
-    let base = if idx < n_heads { base_offset } else { base_offset2 };
-    let h = idx % n_heads;
+    let base = if seg < n_heads { base_offset } else { base_offset2 };
+    let h = seg % n_heads;
     let start = base + h * head_dim;
 
-    let mut sum_sq = 0.0f32;
-    let mut d = 0usize;
+    let mut partial = 0.0f32;
+    let mut d = lane;
     while d < head_dim {
         let v = f32::cast_from(x[start + d]);
-        sum_sq += v * v;
-        d += 1;
+        partial += v * v;
+        d += nlanes;
     }
-    let norm = f32::sqrt(sum_sq + eps);
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    smem[lane] = partial;
+    sync_cube();
+    let mut stride = nlanes / 2;
+    while stride >= 1 {
+        if lane < stride {
+            smem[lane] += smem[lane + stride];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let norm = f32::sqrt(smem[0] + eps);
 
-    let mut d2 = 0usize;
+    let mut d2 = lane;
     while d2 < head_dim {
         x[start + d2] = Act::cast_from(f32::cast_from(x[start + d2]) / norm);
-        d2 += 1;
+        d2 += nlanes;
     }
 }
 
@@ -342,6 +379,8 @@ pub fn l2_norm_heads(
 // path's per-head loop (see `cpu_path.rs`'s gated-RMSNorm comment). `weight`
 // is `[head_dim]` and reused across all `n_heads` segments.
 
+// One workgroup per head, 64 cooperating lanes — was one thread per head
+// serially reducing `head_dim`. Launch `CubeCount(n_heads)`, `CubeDim(64)`.
 #[cube(launch)]
 pub fn gdn_gated_rms_norm(
     x: &mut Array<Act>,
@@ -351,28 +390,41 @@ pub fn gdn_gated_rms_norm(
     head_dim: usize,
     eps: f32,
 ) {
-    let h = ABSOLUTE_POS;
+    let h = CUBE_POS_X as usize;
+    let lane = UNIT_POS as usize;
+    let nlanes = CUBE_DIM as usize;
     if h >= n_heads {
         terminate!();
     }
     let start = h * head_dim;
 
-    let mut sum_sq = 0.0f32;
-    let mut d = 0usize;
+    let mut partial = 0.0f32;
+    let mut d = lane;
     while d < head_dim {
         let v = f32::cast_from(x[start + d]);
-        sum_sq += v * v;
-        d += 1;
+        partial += v * v;
+        d += nlanes;
     }
-    let rms = f32::sqrt(sum_sq / (head_dim as f32) + eps);
+    let mut smem = SharedMemory::<f32>::new(64usize);
+    smem[lane] = partial;
+    sync_cube();
+    let mut stride = nlanes / 2;
+    while stride >= 1 {
+        if lane < stride {
+            smem[lane] += smem[lane + stride];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let rms = f32::sqrt(smem[0] / (head_dim as f32) + eps);
 
-    let mut d2 = 0usize;
+    let mut d2 = lane;
     while d2 < head_dim {
         let normed = weight[d2] * f32::cast_from(x[start + d2]) / rms;
         let g = f32::cast_from(gate[start + d2]);
         let silu = g / (1.0f32 + (-g).exp());
         x[start + d2] = Act::cast_from(normed * silu);
-        d2 += 1;
+        d2 += nlanes;
     }
 }
 

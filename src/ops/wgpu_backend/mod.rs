@@ -179,7 +179,15 @@ impl WgpuBackend {
     /// per-launch time is the *amortized, pipelined* cost — not the isolated
     /// sync-inflated cost. Prints a table. `h` is a real weight tensor (matmul);
     /// `d` = embedding_length, `ff` = feed_forward_length.
-    pub fn probe_kernel_costs(&self, h: &GpuWeightHandle, d: usize, ff: usize, k: usize) {
+    pub fn probe_kernel_costs(
+        &self,
+        h: &GpuWeightHandle,
+        d: usize,
+        ff: usize,
+        n_heads: usize,
+        head_dim: usize,
+        k: usize,
+    ) {
         use std::time::Instant;
 
         // Inputs.
@@ -190,6 +198,8 @@ impl WgpuBackend {
         let u_ff = self.upload_act(&vec![1.0f32; ff]);
         let tiny = self.upload_act(&vec![1.0f32; 64]);
         let tiny2 = self.upload_act(&vec![1.0f32; 64]);
+        let q_heads = self.upload_act(&vec![1.0f32; n_heads * head_dim]);
+        let qk_w = self.upload_activation(&vec![1.0f32; head_dim]);
 
         // (label, closure returning a handle to sync on).
         let mut rows: Vec<(&str, f64)> = Vec::new();
@@ -217,6 +227,21 @@ impl WgpuBackend {
             { let (_n, r) = self.launch_add_residual_rms_norm(&x_d, &x_d, &w_d, d, 1e-5); r }
         );
         bench!("silu_mul(ff)", self.launch_silu_mul(&g_ff, &u_ff, ff));
+
+        // qk_norm_rope is in-place (one thread per head, serial over head_dim):
+        // launch then sync on the mutated buffer.
+        {
+            for _ in 0..3 {
+                self.launch_qk_norm_rope(&q_heads, &qk_w, n_heads, head_dim, 1e-5, head_dim, 1, 1e4);
+                let _ = self.client.read_one_unchecked(q_heads.clone());
+            }
+            let t0 = Instant::now();
+            for _ in 0..k {
+                self.launch_qk_norm_rope(&q_heads, &qk_w, n_heads, head_dim, 1e-5, head_dim, 1, 1e4);
+            }
+            let _ = self.client.read_one_unchecked(q_heads.clone());
+            rows.push(("qk_norm_rope [1-thread/head]", t0.elapsed().as_secs_f64() / k as f64 * 1e3));
+        }
 
         println!("\n{:>36}  {:>12}", "kernel", "ms/dispatch");
         for (label, ms) in &rows {

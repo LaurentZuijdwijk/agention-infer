@@ -46,9 +46,11 @@ fn main() {
         tensor.dims[1..].iter().product::<u64>(),
     );
 
+    let n_heads = cfg.head_count as usize;
+    let head_dim = cfg.head_dim as usize;
     let backend = WgpuBackend::new();
     let h = backend.upload_weight(tensor.ggml_type, bytes, in_dim);
-    backend.probe_kernel_costs(&h, d, ff, 500);
+    backend.probe_kernel_costs(&h, d, ff, n_heads, head_dim, 500);
 }
 
 #[cfg(not(feature = "wgpu"))]
