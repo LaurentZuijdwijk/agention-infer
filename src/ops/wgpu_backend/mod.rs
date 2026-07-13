@@ -377,6 +377,55 @@ impl WgpuBackend {
         );
     }
 
+    /// Micro-benchmark `gdn_recurrence` (the Gated DeltaNet per-token delta-rule
+    /// update): one workgroup per v-head, `head_v_dim` cooperating lanes, each
+    /// owning one state-matrix column with no cross-thread sync. Unlike
+    /// attention, this kernel's cost does NOT grow with context (it's O(1)
+    /// state, not a KV-cache scan) — the question is whether `head_v_dim`
+    /// (the launch's `CubeDim`) is large enough to fill a wavefront/CU well.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_gdn_recurrence_cost(
+        &self,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        key_dim: usize,
+        conv_dim: usize,
+        k: usize,
+    ) {
+        use std::time::Instant;
+
+        let state = self.upload_activation(&vec![0.1f32; n_v_heads * head_k_dim * head_v_dim]);
+        let conv_out = self.upload_act(&vec![0.1f32; conv_dim]);
+        let beta = self.upload_act(&vec![0.5f32; n_v_heads]);
+        let decay = self.upload_act(&vec![0.9f32; n_v_heads]);
+        let scale = 1.0f32 / (head_k_dim as f32).sqrt();
+
+        println!(
+            "\ngdn_recurrence: n_v_heads={n_v_heads} n_k_heads={n_k_heads} head_k_dim={head_k_dim} \
+             head_v_dim={head_v_dim} (= CubeDim, wavefront fill) value_dim={}",
+            n_v_heads * head_v_dim
+        );
+
+        for _ in 0..3 {
+            let o = self.launch_gdn_recurrence(
+                &state, &conv_out, &beta, &decay, n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, scale,
+            );
+            let _ = self.client.read_one_unchecked(o);
+        }
+        let t0 = Instant::now();
+        let mut last = None;
+        for _ in 0..k {
+            last = Some(self.launch_gdn_recurrence(
+                &state, &conv_out, &beta, &decay, n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, scale,
+            ));
+        }
+        let _ = self.client.read_one_unchecked(last.unwrap());
+        let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+        println!("gdn_recurrence: {ms:.4} ms/dispatch (called once per GDN layer per token)");
+    }
+
     /// Launch the consolidated dequant matmul using a pre-uploaded weight tensor.
     pub fn matmul_dequant_preloaded(
         &self,

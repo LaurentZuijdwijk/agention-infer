@@ -56,6 +56,25 @@ fn main() {
     let max_seq = 2048;
     let positions = [0usize, 15, 63, 255, 1023, 2047];
     backend.probe_attention_costs(n_heads, n_kv_heads, head_dim, max_seq, &positions, 200);
+
+    // Gated DeltaNet dims (Qwen3.5/Qwen3-Next), same derivation as
+    // LlamaModel::from_gguf_with_backend. Absent → model has no GDN layers.
+    let arch_key = |field: &str| format!("{}.{field}", cfg.architecture);
+    let d_state = gguf.get_u64(&arch_key("ssm.state_size"));
+    let n_group = gguf.get_u64(&arch_key("ssm.group_count"));
+    let d_inner = gguf.get_u64(&arch_key("ssm.inner_size"));
+    let dt_rank = gguf.get_u64(&arch_key("ssm.time_step_rank"));
+    if let (Some(d_state), Some(n_group), Some(d_inner), Some(dt_rank)) = (d_state, n_group, d_inner, dt_rank) {
+        let head_k_dim = d_state as usize;
+        let n_k_heads = n_group as usize;
+        let n_v_heads = dt_rank as usize;
+        let head_v_dim = d_inner as usize / n_v_heads;
+        let key_dim = head_k_dim * n_k_heads;
+        let conv_dim = 2 * key_dim + n_v_heads * head_v_dim;
+        backend.probe_gdn_recurrence_cost(n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, 500);
+    } else {
+        println!("\n(model has no GatedDeltaNet layers — skipping gdn_recurrence probe)");
+    }
 }
 
 #[cfg(not(feature = "wgpu"))]
