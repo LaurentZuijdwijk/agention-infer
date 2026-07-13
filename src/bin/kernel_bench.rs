@@ -70,8 +70,34 @@ fn main() {
         let n_v_heads = dt_rank as usize;
         let head_v_dim = d_inner as usize / n_v_heads;
         let key_dim = head_k_dim * n_k_heads;
-        let conv_dim = 2 * key_dim + n_v_heads * head_v_dim;
+        let value_dim = n_v_heads * head_v_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let d_conv = gguf.get_u64(&arch_key("ssm.conv_kernel")).unwrap() as usize;
         backend.probe_gdn_recurrence_cost(n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, 500);
+
+        // Full GDN mixer chain, one real layer's weights (blk.0), to get an
+        // evidence-based total for fusion ROI instead of guessing.
+        let get_bytes = |name: &str| -> (gguf_rs::GgmlType, usize, &[u8]) {
+            let t = gguf.tensors.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("missing tensor {name}"));
+            let in_dim = t.dims[0] as usize;
+            let bytes = &data[t.byte_offset as usize..t.byte_offset as usize + t.byte_size()];
+            (t.ggml_type, in_dim, bytes)
+        };
+        let (wqkv_dt, wqkv_in, wqkv_b) = get_bytes("blk.0.attn_qkv.weight");
+        let (wgate_dt, wgate_in, wgate_b) = get_bytes("blk.0.attn_gate.weight");
+        let (beta_dt, beta_in, beta_b) = get_bytes("blk.0.ssm_beta.weight");
+        let (alpha_dt, alpha_in, alpha_b) = get_bytes("blk.0.ssm_alpha.weight");
+        let (out_dt, out_in, out_b) = get_bytes("blk.0.ssm_out.weight");
+        let h_wqkv = backend.upload_weight(wqkv_dt, wqkv_b, wqkv_in);
+        let h_wgate = backend.upload_weight(wgate_dt, wgate_b, wgate_in);
+        let h_beta = backend.upload_weight(beta_dt, beta_b, beta_in);
+        let h_alpha = backend.upload_weight(alpha_dt, alpha_b, alpha_in);
+        let h_out = backend.upload_weight(out_dt, out_b, out_in);
+
+        backend.probe_gdn_chain_cost(
+            &h_wqkv, &h_wgate, &h_beta, &h_alpha, &h_out,
+            d, n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, d_conv, 200,
+        );
     } else {
         println!("\n(model has no GatedDeltaNet layers — skipping gdn_recurrence probe)");
     }

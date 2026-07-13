@@ -426,6 +426,188 @@ impl WgpuBackend {
         println!("gdn_recurrence: {ms:.4} ms/dispatch (called once per GDN layer per token)");
     }
 
+    /// Measures the full Gated DeltaNet mixer chain (all 10 launches from
+    /// `gpu_resident.rs`'s GatedDeltaNet branch) two ways, to give an
+    /// evidence-based answer on kernel-fusion ROI instead of guessing from
+    /// isolated per-kernel numbers:
+    ///
+    /// 1. **Sum of isolated costs** — each step timed alone (K iterations,
+    ///    sync only at the end of that step's loop, same methodology as every
+    ///    other probe in this file).
+    /// 2. **True chain cost** — all 10 steps back-to-back with NO intermediate
+    ///    sync (K full chains, one final sync) — this matches exactly how
+    ///    `gpu_resident.rs`'s real per-layer loop runs (it never reads
+    ///    intermediate results either).
+    ///
+    /// If (2) ≈ (1), each dispatch still pays close to its isolated cost even
+    /// when chained — meaning only *actual* kernel fusion (fewer dispatches)
+    /// can cut further. If (2) ≪ (1), the GPU/driver already overlaps chained
+    /// dispatches well, and fusion's real headroom is smaller than the
+    /// isolated numbers suggest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_gdn_chain_cost(
+        &self,
+        h_wqkv: &GpuWeightHandle,
+        h_wgate: &GpuWeightHandle,
+        h_beta: &GpuWeightHandle,
+        h_alpha: &GpuWeightHandle,
+        h_out: &GpuWeightHandle,
+        d_model: usize,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        key_dim: usize,
+        conv_dim: usize,
+        d_conv: usize,
+        k: usize,
+    ) {
+        use std::time::Instant;
+
+        let eps = 1e-5f32;
+        let scale = 1.0f32 / (head_k_dim as f32).sqrt();
+        let xn = self.upload_act(&vec![0.1f32; d_model]);
+        let ssm_a = self.upload_activation(&vec![0.5f32; n_v_heads]);
+        let dt_bias = self.upload_activation(&vec![0.1f32; n_v_heads]);
+        let conv_weight = self.upload_activation(&vec![0.1f32; conv_dim * d_conv]);
+        let conv_history = self.upload_activation(&vec![0.0f32; conv_dim * d_conv.saturating_sub(1)]);
+        let state = self.upload_activation(&vec![0.1f32; n_v_heads * head_k_dim * head_v_dim]);
+        let ssm_norm = self.upload_activation(&vec![1.0f32; head_v_dim]);
+
+        // One full, unsynced chain iteration (mirrors gpu_resident.rs exactly).
+        let run_chain = || -> cubecl::server::Handle {
+            let qkv_handle = self.launch_only(h_wqkv, &xn);
+            let gate_out_handle = self.launch_only(h_wgate, &xn);
+            let beta_handle = self.launch_only(h_beta, &xn);
+            let alpha_handle = self.launch_only(h_alpha, &xn);
+            self.launch_gdn_gate_decay(&beta_handle, &alpha_handle, &ssm_a, &dt_bias, n_v_heads);
+            let conv_handle = self.launch_causal_conv1d_silu(&qkv_handle, &conv_weight, &conv_history, conv_dim, d_conv);
+            self.launch_l2_norm_heads(&conv_handle, 0, key_dim, n_k_heads, head_k_dim, eps, conv_dim);
+            let gdn_out_handle = self.launch_gdn_recurrence(
+                &state, &conv_handle, &beta_handle, &alpha_handle, n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, scale,
+            );
+            self.launch_gdn_gated_norm(&gdn_out_handle, &ssm_norm, &gate_out_handle, n_v_heads, head_v_dim, eps);
+            self.launch_only(h_out, &gdn_out_handle)
+        };
+
+        // 1. Sum of isolated per-step costs.
+        macro_rules! isolated {
+            ($label:expr, $body:expr) => {{
+                for _ in 0..3 {
+                    let o = $body;
+                    let _ = self.client.read_one_unchecked(o);
+                }
+                let t0 = Instant::now();
+                let mut last = None;
+                for _ in 0..k {
+                    last = Some($body);
+                }
+                let _ = self.client.read_one_unchecked(last.unwrap());
+                let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+                println!("  {:>28}  {:.4} ms", $label, ms);
+                ms
+            }};
+        }
+        println!("\n=== GDN mixer chain: sum of isolated per-step costs ===");
+        let mut sum = 0.0;
+        sum += isolated!("wqkv matmul", self.launch_only(h_wqkv, &xn));
+        sum += isolated!("wgate matmul", self.launch_only(h_wgate, &xn));
+        sum += isolated!("ssm_beta matmul", self.launch_only(h_beta, &xn));
+        sum += isolated!("ssm_alpha matmul", self.launch_only(h_alpha, &xn));
+        {
+            let beta_handle = self.launch_only(h_beta, &xn);
+            let alpha_handle = self.launch_only(h_alpha, &xn);
+            for _ in 0..3 {
+                self.launch_gdn_gate_decay(&beta_handle, &alpha_handle, &ssm_a, &dt_bias, n_v_heads);
+                let _ = self.client.read_one_unchecked(beta_handle.clone());
+            }
+            let t0 = Instant::now();
+            for _ in 0..k {
+                self.launch_gdn_gate_decay(&beta_handle, &alpha_handle, &ssm_a, &dt_bias, n_v_heads);
+            }
+            let _ = self.client.read_one_unchecked(beta_handle.clone());
+            let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+            println!("  {:>28}  {ms:.4} ms", "gdn_gate_decay");
+            sum += ms;
+        }
+        {
+            let qkv_handle = self.launch_only(h_wqkv, &xn);
+            sum += isolated!(
+                "causal_conv1d_silu",
+                self.launch_causal_conv1d_silu(&qkv_handle, &conv_weight, &conv_history, conv_dim, d_conv)
+            );
+        }
+        {
+            let qkv_handle = self.launch_only(h_wqkv, &xn);
+            let conv_handle = self.launch_causal_conv1d_silu(&qkv_handle, &conv_weight, &conv_history, conv_dim, d_conv);
+            for _ in 0..3 {
+                self.launch_l2_norm_heads(&conv_handle, 0, key_dim, n_k_heads, head_k_dim, eps, conv_dim);
+                let _ = self.client.read_one_unchecked(conv_handle.clone());
+            }
+            let t0 = Instant::now();
+            for _ in 0..k {
+                self.launch_l2_norm_heads(&conv_handle, 0, key_dim, n_k_heads, head_k_dim, eps, conv_dim);
+            }
+            let _ = self.client.read_one_unchecked(conv_handle.clone());
+            let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+            println!("  {:>28}  {ms:.4} ms", "l2_norm_heads");
+            sum += ms;
+        }
+        {
+            let qkv_handle = self.launch_only(h_wqkv, &xn);
+            let beta_handle = self.launch_only(h_beta, &xn);
+            let alpha_handle = self.launch_only(h_alpha, &xn);
+            let conv_handle = self.launch_causal_conv1d_silu(&qkv_handle, &conv_weight, &conv_history, conv_dim, d_conv);
+            sum += isolated!(
+                "gdn_recurrence",
+                self.launch_gdn_recurrence(
+                    &state, &conv_handle, &beta_handle, &alpha_handle, n_v_heads, n_k_heads, head_k_dim, head_v_dim, key_dim, conv_dim, scale,
+                )
+            );
+        }
+        {
+            let gate_out_handle = self.launch_only(h_wgate, &xn);
+            let gdn_out_handle = self.upload_act(&vec![0.1f32; n_v_heads * head_v_dim]);
+            for _ in 0..3 {
+                self.launch_gdn_gated_norm(&gdn_out_handle, &ssm_norm, &gate_out_handle, n_v_heads, head_v_dim, eps);
+                let _ = self.client.read_one_unchecked(gdn_out_handle.clone());
+            }
+            let t0 = Instant::now();
+            for _ in 0..k {
+                self.launch_gdn_gated_norm(&gdn_out_handle, &ssm_norm, &gate_out_handle, n_v_heads, head_v_dim, eps);
+            }
+            let _ = self.client.read_one_unchecked(gdn_out_handle.clone());
+            let ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+            println!("  {:>28}  {ms:.4} ms", "gdn_gated_norm");
+            sum += ms;
+        }
+        {
+            let gdn_out_handle = self.upload_act(&vec![0.1f32; n_v_heads * head_v_dim]);
+            sum += isolated!("ssm_out matmul", self.launch_only(h_out, &gdn_out_handle));
+        }
+        println!("  {:>28}  {sum:.4} ms  (sum of isolated steps)", "TOTAL");
+
+        // 2. True chain cost: no intermediate sync, matching gpu_resident.rs.
+        for _ in 0..3 {
+            let o = run_chain();
+            let _ = self.client.read_one_unchecked(o);
+        }
+        let t0 = Instant::now();
+        let mut last = None;
+        for _ in 0..k {
+            last = Some(run_chain());
+        }
+        let _ = self.client.read_one_unchecked(last.unwrap());
+        let chain_ms = t0.elapsed().as_secs_f64() / k as f64 * 1e3;
+        println!("\n=== GDN mixer chain: true unsynced cost (matches production) ===");
+        println!("  {chain_ms:.4} ms/layer (10 dispatches, one final sync)");
+        println!(
+            "\nGap (sum_isolated - chain) = {:.4} ms already free via async pipelining.\n\
+             Remaining chain cost ({chain_ms:.4} ms) is the real floor fusion would need to beat.",
+            sum - chain_ms
+        );
+    }
+
     /// Launch the consolidated dequant matmul using a pre-uploaded weight tensor.
     pub fn matmul_dequant_preloaded(
         &self,

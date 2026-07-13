@@ -485,45 +485,63 @@ free and correct, so it stays.
 
 ---
 
-## Priority 11: GPU Path — Attention Softmax/Score Is Two Extra Launches Per Token ⚠️ ANALYZED, HIGH REGRESSION RISK — NOT ATTEMPTED
+## Priority 11: GPU Path — Attention Softmax Parallelism ✅ IMPLEMENTED (correcting the 2026-07-08 analysis below)
 
-**Status:** ⚠️ Analyzed 2026-07-08, deliberately not implemented. The premise
-(three dispatches, three sync points, every attention layer, every token) is
-correct, but a naive fusion has a parallelism problem that two *other* changes
-this session already demonstrated regresses on this GPU (see the new section
-below) — so this was reasoned through and rejected rather than tried and
-reverted a third time.
+**Status:** ✅ Done 2026-07-13. The *fusing scores+softmax into one dispatch*
+idea analyzed below was correctly identified as high-risk and was **not**
+what got built — instead, `attention_softmax` was independently reprofiled
+with the same forced-sync micro-benchmark methodology used for Priority 16/17
+(`bin/kernel_bench`, `WgpuBackend::probe_attention_costs`), and its own claim
+("dispatch is already tiny... realistic upside of removing it is small") was
+**checked directly and found wrong at long context**:
+
+| pos | softmax before | after |
+|---|---|---|
+| 15 | 0.051ms | 0.005ms |
+| 1023 | 0.175ms | 0.0095ms |
+| 2047 | **0.340ms** | **0.0146ms** (23×, no longer scales with `pos`) |
+
+The root cause was exactly the anti-pattern this doc's Priority 16/17 fixes
+describe: one thread per head (16-32 threads) serially scanning `0..=pos`
+*twice* (max pass, then exp/sum pass) — the analysis below assumed this was
+"already tiny" based on short-context reasoning, but it scales directly with
+context length and was comparable to a full matmul at `pos≈2000`.
+
+**Fix:** one workgroup per head, 64 cooperating lanes, two-phase
+shared-memory tree reduction (max, then exp+sum) — the exact same pattern as
+Priority 16, applied to a different kernel. Hit one new cubecl codegen quirk:
+a self-referential compound assignment on the running max panicked
+("mutable operation on a const variable"); resolved with `RuntimeCell` for
+the per-lane max scan, mirroring the ReLU-style `+=` trick the original
+single-threaded kernel already used for ordinary reassignment restrictions.
+
+End-to-end decode at *short* context (the golden/bench prompts, pos<100) is
+neutral (~20.9 tok/s, matches pre-fix) — expected, since the old serial
+softmax was already cheap there. The win is specifically for long-context
+decode, where naive per-head softmax would otherwise become a real cost.
+
+**Original 2026-07-08 analysis (kept for context — the fusion idea it
+evaluated is still unattempted and still looks high-risk):**
 
 `attention_scores` runs one thread per `(head, kv-position)` pair — for this
 model/benchmark, `16 heads × 61 positions ≈ 976 threads` across 16
 workgroups, each doing a cheap `O(head_dim)=256` dot product.
-`attention_softmax` runs at a *different, much coarser* granularity: one
+`attention_softmax` ran at a *different, much coarser* granularity: one
 thread per head (16 threads, 1 workgroup), each sequentially scanning all
-`pos+1` positions twice (max pass, then exp/sum pass). A straightforward
-"fuse them" implementation has to pick one granularity, and picking the
-coarser one (16 threads doing everything) turns `attention_scores`' cheap
-`O(head_dim)` per-thread work into `O(seq_len × head_dim)` sequential work
-per thread — the same "consolidate many small parallel units into fewer,
-busier ones" pattern that cost 9.5→6.0 tok/s and, even in a more careful
-form, 9.5→8.1 tok/s in the matmul multi-row experiments this session (see
-below). It also gets *worse* as `pos` grows over generation, unlike the
-matmul case which was a fixed per-call cost.
+`pos+1` positions twice. A straightforward "fuse them" implementation has to
+pick one granularity, and picking the coarser one (16 threads doing
+everything) turns `attention_scores`' cheap `O(head_dim)` per-thread work
+into `O(seq_len × head_dim)` sequential work per thread — the same
+"consolidate many small parallel units into fewer, busier ones" pattern that
+cost 9.5→6.0 tok/s in the matmul multi-row experiments. **This fusion idea
+remains unattempted and the risk analysis still stands** — what changed is
+only that softmax's *own* (unfused) parallelism was fixed separately, which
+was lower-risk and didn't require picking a shared granularity with scores.
 
-Separately: `attention_softmax`'s dispatch is already tiny (1 workgroup, 16
-threads) — smaller than the 64-workgroup case in the raw-Vulkan probe that
-measured near-zero cost at that scale. So the realistic upside of removing it
-is small, and the realistic downside (a third parallelism-reduction
-regression, this time scaling unfavorably with context length) is real.
-
-A version that avoids the regression — computing partial max/sum per
-position-block in parallel and combining them (true flash-attention tiling,
-not a naive granularity collapse) — is real engineering, not a quick kernel
-merge, and wasn't attempted given the size of the lift for an already-cheap
-kernel.
-
-**Effort:** Medium (naive, likely regresses) / High (parallelism-preserving,
-untested) | **Impact:** Small even if it works — not recommended without new
-evidence changing the analysis above
+**Effort:** Medium (naive fusion, likely regresses) / High
+(parallelism-preserving fusion, untested) | **Impact:** Small even if fusion
+works, now that softmax's own cost is fixed — not recommended without new
+evidence.
 
 ---
 
@@ -658,79 +676,358 @@ have actually worked so far.
 
 ---
 
-## Priority 14: GPU Path — Vectorized Byte Reads in Quant Dequant Kernels ⏳ NOT ATTEMPTED (proposed, untested)
+## Priority 14: GPU Path — Vectorized Byte Reads in Quant Dequant Kernels ✅ IMPLEMENTED FOR Q4_K, Q5_K/Q6_K OPEN
 
-**Status:** ⏳ Proposed 2026-07-08, not attempted this session — flagged as
-the most promising *remaining* lever precisely because it doesn't touch
-thread/workgroup parallelism at all (avoids the failure mode documented
-above).
+**Status:** ✅ Done for Q4_K 2026-07-13 — this was the single biggest win of
+that session, exactly as the 2026-07-08 proposal below predicted ("safe
+shape," no parallelism change).
 
-`read_byte_u32` (`kernels_wgpu.rs`) reads one `u32` word from the packed
-weight array and extracts a single byte via shift+mask:
-```rust
-fn read_byte_u32(w: &Array<u32>, byte_offset: usize) -> u32 {
-    (w[byte_offset / 4] >> (8u32 * (byte_offset % 4) as u32)) & 0xFFu32
-}
-```
-`partial_q4_k`/`partial_q5_k`'s inner loops call this **once per byte** even
-when reading 4 (or more) consecutive bytes from what is often the same
-4-byte-aligned `u32` word — e.g. `partial_q4_k`'s `while l < 32 { qb =
-read_byte_u32(w, qs_byte_off + l); ... }` re-fetches and re-shifts the same
-backing word up to 4 times per word instead of reading it once and unpacking
-all 4 bytes. llama.cpp's Vulkan `mul_mat_vec_q4_k.comp` (see
-`~/Projects/llama-cpp-turboquant/ggml/src/ggml-vulkan/vulkan-shaders/`)
-does exactly this kind of unpacking (`unpack8` on a `u32`, `vec4` loads) —
-worth pulling the actual bit-tricks from there rather than re-deriving them,
-per the earlier decision to reuse their kernels if we ever invest here.
+`read_byte_u32` (`kernels_wgpu.rs`) read one `u32` word from the packed
+weight array and extracted a single byte via shift+mask, called **once per
+byte** even when reading 4 consecutive bytes from the same 4-byte-aligned
+word — `partial_q4_k`'s inner loop re-fetched and re-shifted the same
+backing word up to 4 times per word. Fixed: read one `u32` per 4 bytes
+(`qs_byte_off` is always 4-aligned — all its terms are multiples of 4),
+unpack all 4 nibbles from one fetch.
 
-**Caveat:** block sizes aren't uniformly 4-aligned — Q4_K (144 bytes/block)
-and Q5_K (176 bytes/block) are divisible by 4, but Q6_K (210 bytes/block) is
-not, so Q6_K's per-block byte offsets won't always land on a word boundary
-and would need unaligned-read handling (combining parts of two words) if
-vectorized. Q4_K and Q5_K are the safer first targets — and are also the two
-dtypes this model uses most (132 and 48 tensors respectively, vs. 22 Q6_K
-tensors and 48 Q8_0).
+| | before | after |
+|---|---|---|
+| matmul (4096×12288, Q4_K) | 0.338ms | **0.178ms** (1.9×) |
+| decode (Qwen3.5-9B) | 16.55 tok/s | **20.92 tok/s** (+26%) |
+| % bandwidth ceiling | 36% | **46%** |
 
-**Effort:** Medium (careful bit-manipulation, real correctness risk requiring
-the same rigor as the earlier Q4_K/Q5_K debugging this session) | **Impact:**
-Unknown, plausibly Low-Medium — reduces redundant shared/global memory
-traffic per thread without changing occupancy, so it's in the "safe shape"
-category, but hasn't been measured.
+Golden token-parity green on all 4 models, CPU + GPU (this is a
+bit-manipulation change to quant unpacking — correctness-critical to verify,
+and was).
+
+**Q5_K and Q6_K are still open.** Q5_K's 176-byte blocks are 4-aligned (same
+fix applies directly); Q6_K's 210-byte blocks are **not** 4-aligned (the
+original caveat below still applies — needs unaligned-read handling,
+combining parts of two words). Worth doing if a Q5_K/Q6_K-heavy model becomes
+a target; this session's model (Qwen3.5-9B-Q4_K_M) is Q4_K-dominant so Q6_K
+wasn't pursued.
+
+**Original 2026-07-08 proposal (superseded by the Q4_K result above; kept for
+the Q6_K alignment caveat):** llama.cpp's Vulkan `mul_mat_vec_q4_k.comp` (see
+`~/Projects/llama-cpp-turboquant/ggml/src/ggml-vulkan/vulkan-shaders/`) does
+the same kind of unpacking (`unpack8` on a `u32`, `vec4` loads) — worth
+pulling the actual bit-tricks from there if Q6_K is tackled, rather than
+re-deriving them.
+
+**Effort:** Medium (careful bit-manipulation, real correctness risk) |
+**Impact:** Confirmed High for Q4_K — 1.9× the dominant per-token matmul cost.
 
 ---
 
-## Priority 15: GPU Path — f16 Intermediate Activations ⏳ NOT ATTEMPTED (proposed, untested)
+## Priority 15: GPU Path — f16 Intermediate Activations ✅ IMPLEMENTED (smaller win than expected — see Priorities 16/17/14 for why)
 
-**Status:** ⏳ Proposed 2026-07-08, not attempted — a different lever than
-everything above: reducing *data volume* rather than *dispatch count* or
-*parallelism shape*.
+**Status:** ✅ Done (Phase 1 Stage 4, before the kernel-parallelism work
+below). Default build now stores GPU-resident activations as `f16` (feature
+`f32-activations` opts back to `f32` for backends without shader-f16, e.g.
+wgpu→Metal). f32 accumulators kept inside every kernel throughout — only
+storage narrows. Native f16 compute confirmed working on this Vulkan device
+via a standalone probe (`bin/f16_probe.rs`) before committing to the full
+kernel rewrite. GDN recurrent state, attention score/softmax scratch, and
+logits deliberately kept `f32` per the risk noted below.
 
-Every intermediate activation buffer in the resident path (`x_handle`,
-`xn_handle`, `q_h`/`k_h`/`v_h`, FFN's `gate_handle`/`up_handle`, the KV cache
-itself, etc.) is `f32`. This is a single-token (batch=1) decode workload on a
-unified-memory APU, which tends to be memory-bandwidth-bound rather than
-compute-bound — halving the byte-width of every intermediate read/write
-(switching to `f16`) directly halves bandwidth pressure for all of them,
-independent of the dispatch-parallelism findings above. llama.cpp's own
-shader generator supports this as a first-class option (`f16acc`
-specializations throughout `vulkan-shaders-gen.cpp`), which suggests it's a
-real, load-bearing lever on this class of hardware, not a marginal one.
+**Measured result — smaller than the "potentially High" estimate below
+predicted:** decode 9.49 (f32) → 9.72 (f16) tok/s, **~2-3%**, not the
+bandwidth-halving win the `f16acc` comparison to llama.cpp implied. 200-token
+CPU-f32-vs-GPU-f16 drift test (`bin/drift.rs`) clean on the GDN 9B — the
+precision risk called out below didn't materialize.
 
-**Risks:** (1) precision — K-quant dequant already loses precision, and f16
-accumulation could compound it further, especially in the GDN recurrence's
-persistent state (`gpu_gdn_recurrent_state`), which accumulates *across many
-tokens* — errors there could compound over a long generation in a way a
-single-token accuracy check wouldn't catch. Would need a long-generation
-drift check (compare CPU vs. GPU output over hundreds of tokens, not just
-one), not just the single-token `compare_backends` check used elsewhere in
-this doc. (2) scope — touches nearly every kernel and buffer in the resident
-path, the widest-reaching change proposed here.
+**Why the win was small, with hindsight from the rest of this document:**
+this workload was **not actually bandwidth-bound** at the time f16 was
+implemented (21% of the 260GB/s ceiling) — it was bottlenecked by the
+serial-kernel and dequant issues Priorities 16/17/14 later found and fixed.
+Halving activation bytes doesn't help much when the dominant cost is a
+handful of GPU lanes doing wasted serial work, or a matmul re-reading the
+same quant byte 4× — neither of which f16 activations touch. The KV cache is
+now f16 too, so there's a *latent* benefit that should show up more at long
+context (larger KV, more of it moved per token) — not yet re-measured after
+Priorities 16/17/14 changed the bandwidth/compute balance.
 
-**Effort:** High (touches every kernel; needs new verification methodology
-for cross-token precision drift) | **Impact:** Potentially High if this
-workload is genuinely bandwidth-bound (plausible for batch=1 decode on
-unified memory, unconfirmed) — the highest-uncertainty, highest-ceiling item
-in this document.
+**Original 2026-07-08 risk analysis (for the record — didn't materialize):**
+K-quant dequant already loses precision, and f16 accumulation could compound
+it further, especially in the GDN recurrence's persistent state, which
+accumulates *across many tokens*. Verified clean via the drift test built for
+this purpose.
+
+**Effort:** High (touched every kernel; new drift-test methodology) |
+**Impact:** Confirmed Low-Medium in isolation (~2-3%), given this workload
+wasn't bandwidth-bound when it landed — revisit once Priorities 16/17/14 push
+utilization high enough that bandwidth becomes the binding constraint again.
+
+---
+
+## Priority 16: GPU Path — RMSNorm Ran Single-Threaded ✅ IMPLEMENTED (biggest single win this session)
+
+**Status:** ✅ Done 2026-07-13. Found by building a proper kernel
+micro-benchmark (`bin/kernel_bench`, `WgpuBackend::probe_kernel_costs` —
+amortized per-dispatch timing via K back-to-back launches + one final sync,
+matching how the real forward pass submits) after the user asked to find real
+GPU speedups rather than more bandwidth-reduction, since decode was only
+~9.72 tok/s at ~21% of the 260GB/s ceiling despite Priorities 1-15 above.
+
+`rms_norm` and `add_residual_rms_norm` ran on a **single GPU thread**
+(`CubeDim::new_1d(1)`), serially reducing `embedding_length` (4096) elements
+per call. Measured cost: **0.49-0.65ms per call** — more than a full
+4096×12288 matmul (0.34ms at the time) — and at ~2 calls/layer × 32-48 layers
+this was roughly **half the entire per-token budget**. This directly
+contradicts the "sync cost dominates at these vector sizes" rationale the
+kernel's original comment gave for staying single-threaded — that assumption
+was never measured and was wrong by 1-2 orders of magnitude.
+
+**Fix:** 256-thread shared-memory tree reduction (the same pattern the
+matmul kernel already used) — each lane reduces a strided slice, then a
+standard `stride/=2` tree combines partials.
+
+| | before | after |
+|---|---|---|
+| rms_norm(d=4096) | 0.49ms | 0.013ms (38×) |
+| add_residual_rms_norm | 0.64ms | 0.014ms (45×) |
+| decode (Qwen3.5-9B) | 9.72 tok/s | **16.03 tok/s (+65%)** |
+| % bandwidth ceiling | 21% | 35% |
+
+Golden token-parity green on all 4 models, CPU + GPU.
+
+**The broader lesson, restated for future readers:** this project was
+**never actually bandwidth-bound** despite Priority 15's framing — it had
+serial-kernel bottlenecks nobody had measured. "This kernel is too small to
+matter" is an assumption, not a fact, until you force-sync and time it.
+
+**Effort:** Low (same tree-reduction pattern already used elsewhere) |
+**Impact:** Confirmed Very High — the single biggest win in this document.
+
+---
+
+## Priority 17: GPU Path — Per-Head Norm Kernels Ran One Thread Per Head ✅ IMPLEMENTED
+
+**Status:** ✅ Done 2026-07-13, same session and methodology as Priority 16,
+smaller scale. `qk_norm_rope`, `l2_norm_heads`, and `gdn_gated_rms_norm` each
+ran **one thread per head** (`~16-32` heads → `~16-32` total threads),
+serially reducing `head_dim` (and, for `qk_norm_rope`, doing per-dim
+`powf`/`sin`/`cos` in that same one thread) — the identical anti-pattern to
+Priority 16, at smaller absolute cost. `qk_norm_rope` measured 0.0925ms/call
+(13× the ~0.007ms dispatch floor).
+
+**Fix:** one workgroup per head (or per segment, for `l2_norm_heads`'s
+Q-range/K-range split), 64 cooperating lanes, shared-memory tree reduction —
+`qk_norm_rope` 0.0925ms → 0.0044ms (21×). Combined with Priority 16:
+16.03 → 16.55 tok/s. Golden green on all 4 models.
+
+**Effort:** Low | **Impact:** Medium (smaller than Priority 16 since these
+run fewer times per token, but same fix, same confidence).
+
+---
+
+## Priority 18: GPU Path — Batched-Prefill Matmul ❌ TESTED, DTYPE-DEPENDENT, NOT ADOPTED
+
+**Status:** ❌ Built and measured 2026-07-13 (was Priority 13, "no prefill
+batching"). Two designs tested with a purpose-built micro-bench
+(`bin/matmul_batch_bench`, `WgpuBackend::probe_batched_matmul`/
+`probe_gdn_chain_cost`) rather than committed on theory alone:
+
+1. **Loop-N-inside-one-workgroup** (`matmul_dequant_wgpu_batch`): each
+   output-row workgroup loops over all N batch tokens, re-reading the same
+   weight row N times, hoping L1 would amortize it. It didn't —
+   `batch/tok` was flat regardless of N on Q8_0 (~0.36ms/tok), and actively
+   *regressed* on Q4_K as N grew (0.68× at N=32) — the same "fewer,
+   busier workgroups lose occupancy" failure mode as the earlier multi-row
+   matmul experiments below.
+2. **Cooperative dequant-once** (`matmul_q8_0_coop_batch`/
+   `matmul_q4_k_coop_batch`): dequantize the weight row into shared memory
+   once per workgroup, then dot it against all N tokens from LDS — this
+   *did* amortize (proving the matmul is dequant-compute-bound, not
+   VRAM-bandwidth-bound): **Q8_0 wins, 1.53× at N=32** (coop/tok
+   0.538→0.215ms). But **Q4_K regresses, 0.36-0.48×** (~2× slower/tok) — the
+   heavier nibble-unpack-into-LDS cost (2.8× overhead already at N=1) swamps
+   the amortization. Both variants exactly correct (`max_abs_err=0` vs the
+   single-token reference).
+
+**Since the flagship model (Qwen3.5-9B) is Q4_K, cooperative batched prefill
+would slow it down, not speed it up.** Winning on Q4_K would need real
+kernel tuning (LDS bank conflicts, footprint, occupancy) starting from a 2-3×
+deficit — high-risk, speculative. GPU prefill stays the per-position loop.
+Kept the probe kernels as reproducible evidence (à la the raw-Vulkan probe
+below).
+
+**Effort:** Medium (built) | **Impact:** Positive for Q8_0-only deployments,
+negative for the Q4_K models this project actually targets — not adopted.
+
+---
+
+## Priority 19: GPU Path — GDN Recurrence Kernel ✅ PROFILED, NO FIX NEEDED
+
+**Status:** ✅ Profiled 2026-07-13 (`WgpuBackend::probe_gdn_recurrence_cost`,
+`probe_gdn_chain_cost`) on the hypothesis that it might share Priority 16/17's
+under-parallelization bug, given Qwen3.5-9B is GDN-heavy (24 of 32 layers).
+It doesn't: `CubeDim = head_v_dim` (128), `n_v_heads` (32) workgroups, each
+thread owns one state-matrix column with zero cross-thread sync, doing
+genuine `O(head_k_dim)` sequential work — not a wasted serial reduction.
+Measured 0.059ms/call, ≈1.4ms of the ~48ms/token budget (~3%) across 24 GDN
+layers — present, not a bottleneck.
+
+**Side finding:** the full GDN mixer chain (10 dispatches: 4 projections +
+gate_decay + conv1d_silu + l2_norm + recurrence + gated_norm + ssm_out) costs
+**more chained with no intermediate sync (0.495ms) than the sum of each
+step measured in isolation (0.395ms)** — a genuine ~20% pipeline-switching
+tax from alternating between 10 different kernel pipelines back-to-back, that
+doesn't show up when the same kernel is repeated in a loop. This is real
+headroom for **kernel fusion** (not per-kernel speedup) — the 4 same-input
+projections (`wqkv`/`wgate`/`ssm_beta`/`ssm_alpha`) are the safest fusion
+candidate (independent linear ops, no state), estimated at ~1-3% of total
+decode time if built — not pursued this session given the modest ROI vs. the
+engineering/correctness-risk cost of a new multi-weight matmul kernel.
+
+**Effort:** N/A (no fix applied) | **Impact:** N/A — documented negative
+result plus a scoped, unbuilt fusion candidate for later.
+
+---
+
+## Priority 20: CubeCL Math Micro-Optimizations (`FastMath`, `FastDivmod`) ❌ TESTED, NO EFFECT
+
+**Status:** ❌ Tested 2026-07-13, reverted (zero diff vs. committed state).
+CubeCL 0.10 exposes `#[cube(fast_math = FastMath::all())]` (relaxed
+IEEE-754 semantics — `NotNaN`/`NotInf`/`ReducedPrecision`/etc., backend-
+dependent) and `FastDivmod<T>` (Barrett-reduction-based fast integer
+division/modulo for a runtime, non-constant divisor).
+
+Applied `FastMath::all()` to all 9 exp/sqrt-heavy kernels (both RMSNorms,
+softmax, both per-head norms, silu/sigmoid, conv-silu, gate-decay) — no
+measurable change, confirmed not noise by checking an *untouched* kernel
+(`wqkv matmul`) drifted by the same ~10-15% between runs as the touched ones
+(ambient/thermal variance, not a real regression or improvement either way).
+
+Applied `FastDivmod<usize>` to `attention_scores`/`attention_output`'s
+`idx / seq_len` / `idx % head_dim` index math (the clearest "uniform,
+non-constant divisor" case in this codebase) — same null result, if anything
+marginally worse (extra multiply-high + shift vs. one division).
+
+**Why these gave nothing, with the rest of this document as context:** by
+this point Priorities 16/17/14 had already removed the actual bottlenecks
+(serial threads, redundant byte reads). The remaining hot kernels are
+dispatch-floor-bound (near their per-launch overhead) or dominated by
+100+-op dot-product loops where 1 division or a handful of `exp`/`sqrt`
+calls is noise. **This class of instruction-level optimization only pays off
+once the real structural bottleneck (parallelism, redundant memory traffic)
+is already fixed** — applying it earlier in the session (e.g. to the
+still-single-threaded RMSNorm) would likely have shown the same null result,
+since the bottleneck there was thread *count*, not per-thread instruction
+cost.
+
+**Effort:** Low (both are simple attribute/type additions) | **Impact:**
+Confirmed zero on this codebase's current kernels — no reason to revisit
+unless a new kernel is written that's genuinely ALU-bound on division or
+transcendentals specifically.
+
+---
+
+## Priority 21: CMMA / Cooperative-Matrix (Tensor-Core-Style) Hardware ✅ CAPABILITY CONFIRMED, NOT ADOPTED
+
+**Status:** ✅ Confirmed working 2026-07-13 via an isolated spike
+(`/home/laurent/Projects/agention/cmma_spike`, not part of this repo) — not
+yet adopted in the engine. See the new "CubeCL Upgrade & Vulkan Library
+Investigation" section below for the full narrative (version research,
+`vulkan_poc` prior art, capability probing methodology).
+
+**The confirmed fact:** this exact GPU (`Radeon 8060S Graphics (RADV
+STRIX_HALO)`), via the RADV Mesa Vulkan driver, advertises
+`VK_KHR_cooperative_matrix` with `FLOAT16×FLOAT16→FLOAT32` at 16×16×16,
+subgroup scope — real tensor-core-style matrix-multiply-accumulate hardware,
+usable through CubeCL's `main` branch (`0.11.0-pre.1`, unreleased) via its
+`#[cube]`-level `cmma` API on the `wgpu` runtime's SPIR-V/Vulkan compiler
+(`wgpu<spirv>`, **not** the default WGSL compiler, which per CubeCL's own
+0.10 README doesn't support tensor cores at all). Verified with an exact
+numeric match against CubeCL's own reference test values, not just "it
+compiled."
+
+**Why this isn't being adopted now:** two structural mismatches with this
+project's actual workload. (1) CMMA operates on **dense** f16 tiles; our
+weights are quantized (Q4_K/Q5_K/Q6_K/Q8_0) and would still need dequanting
+first — CMMA doesn't remove that cost, it just changes what consumes the
+dequantized values. (2) CMMA wants `M≥16` to fill a tile; batch=1 **decode**
+(this project's current bottleneck) has `M=1`, wasting 15/16 of the tile —
+this would only pay off for **batched prefill** with pre-dequantized f16
+weights, and Priority 18 above already shows the naive batched-prefill
+approach regresses on Q4_K. Real adoption means hand-writing a Vulkan
+compute shader outside CubeCL's existing kernel set, pre-dequantizing
+weights to dense f16 (a memory-footprint tradeoff), and restructuring around
+batched shapes — by far the largest lift considered this session, and
+squarely **Phase 2 (GPU performance / flash-attention) territory**, not a
+Phase 1 fit.
+
+**Effort:** Unknown, likely Very High (from-scratch Vulkan compute shader,
+new weight-preprocessing pipeline) | **Impact:** Unknown/unmeasured for our
+actual quantized-weight, batch=1-decode workload — confirmed hardware
+capability, unconfirmed real-world speedup. Revisit for Phase 2 batched
+prefill / flash attention.
+
+---
+
+## CubeCL Upgrade & Vulkan Library Investigation (2026-07-13)
+
+Prompted by "should we look at a different GPU library" after Priority 20's
+null result. Documenting the full chain of reasoning since each step
+corrected the previous one — useful if this question comes up again.
+
+**Is there a newer CubeCL release?** No. `cargo info cubecl` and the crates.io
+sparse index both show `0.10.0` as the latest published version — no `0.11`
+has been released. `main` on GitHub is `0.11.0-pre.1`, pre-release-branch-cut
+(confirmed via `git ls-remote --heads`: `release/0.10` exists, no
+`release/0.11`), and CubeCL's own README calls itself "**alpha**... a lot of
+rough edges." "Upgrading" would mean depending on an unreleased, unpinned git
+commit for a project whose bar is exact token-parity — a materially
+different risk profile than the stable 0.10.0 release everything else in
+this doc was measured against. **Recommendation stands: don't float on `main`
+for the production engine; pin to a specific commit only if/when a specific
+capability is confirmed worth the risk** (see below).
+
+**Is a different Vulkan *library* (bypassing CubeCL) worth trying?** Already
+answered, and already in this repo: `bin/vulkan_poc.rs` (feature
+`vulkan-poc`) is a hand-written raw-`ash` compute-shader dispatch-overhead
+probe. Documented result (see "What We Learned About This GPU's Dispatch
+Cost" above): raw Vulkan's per-dispatch cost (~289µs) was **not** better than
+CubeCL/wgpu's own (~220-289µs) on the same shape — "switching APIs doesn't
+help" for *dispatch overhead*. Re-litigating that specific question with a
+different Vulkan wrapper crate (`vulkano`, etc.) would just reconfirm it —
+the overhead is inherent to this hardware/driver, not a CubeCL tax.
+
+**Is there a *different* capability worth the CubeCL-main risk?**
+Yes — cooperative-matrix (CMMA). The 0.10 README states tensor-core
+acceleration "isn't supported on WebGPU yet" (CubeCL's wgpu backend,
+CUDA/NVIDIA-first). Reading CubeCL's `main` source directly (the user cloned
+it to `/home/laurent/Projects/agention/cubecl`) found a full, real CMMA
+implementation added since 0.10: an IR instruction (`cubecl-ir/src/cmma.rs`),
+SPIR-V codegen (`cubecl-spirv/src/cmma.rs`), a `#[cube]`-level frontend API
+(`cubecl-core/src/frontend/cmma.rs`), and CubeCL's own runtime tests
+exercising it. This is Priority 21 above — confirmed working on this exact
+GPU via an isolated spike crate, not adopted into the engine (structural
+mismatch with quantized weights + batch=1 decode; Phase 2 candidate for
+batched prefill instead).
+
+**Methodology note, since it mattered twice:** every empirical measurement in
+this investigation (and this document generally) needs the GPU to actually be
+idle and cool. This session hit two false alarms — a ~2× "regression" in an
+untouched kernel traced to a concurrent `llama-server` process sharing the
+GPU, and later to residual heat (78°C vs. the ~47-50°C clean baseline) from
+back-to-back benchmark runs. **Before trusting any GPU perf number in this
+codebase: `ps aux | grep llama-server` and check
+`/sys/class/hwmon/hwmon*/temp1_input` (>65°C is a throttle-risk signal).**
+Re-measure after confirming both are clear before drawing conclusions.
+
+**How the CMMA capability was confirmed** (reusable methodology): rather than
+touch this engine's dependencies at all, a throwaway crate
+(`/home/laurent/Projects/agention/cmma_spike`, `cubecl = { path =
+"...cubecl/crates/cubecl", features = ["vulkan"] }`) queried
+`client.features().matmul.cmma` and ran CubeCL's own reference CMMA kernel,
+checking output against CubeCL's own expected values. Two gotchas: (1) the
+default `wgpu` feature selects the **WGSL** compiler (`wgpu<wgsl>`, no tensor
+cores, matching the README); the **`vulkan`** feature (=`wgpu` +
+`cubecl-wgpu/spirv`) is needed to get `wgpu<spirv>`, which does. (2) AMD's
+wgpu plane/wavefront size is a runtime-queried range (`plane_size_min..max`,
+32-64 here), not a fixed constant like NVIDIA/HIP — must be read from
+`client.properties().hardware`, not assumed.
 
 ---
 
@@ -762,11 +1059,17 @@ if quality loss is acceptable for a given use case.
 | 8 | GPU: embed dequant+upload per token | Low | Medium | ❌ Measured, not viable (3µs/token; 3.8GiB cache cost) |
 | 9 | GPU: per-token buffer alloc storm | Medium | Medium-High | ❌ Tested, no effect (revert) |
 | 10 | GPU: `env::var` per matmul (trace) | Low | Low | ✅ Done (OnceLock) |
-| 11 | GPU: fuse attention softmax into scores | Medium | Medium | ⚠️ Analyzed, high regression risk — not attempted |
+| 11 | GPU: attention softmax parallelism | Low | High (at long context) | ✅ Done — 23× at pos=2047; fusion-into-scores idea still not attempted |
 | 12 | GPU: ad-hoc matmul re-packs+re-uploads | Low-Medium | High (if hit) | ❌ Open |
-| 13 | GPU: no prefill batching | High | High | ❌ Open |
-| 14 | GPU: vectorized byte reads in dequant kernels | Medium | Unknown (Low-Med) | ⏳ Proposed, untested — safe parallelism shape |
-| 15 | GPU: f16 intermediate activations | High | Potentially High | ⏳ Proposed, untested — highest ceiling, highest risk |
+| 13 | GPU: no prefill batching | High | High | ❌ Superseded by #18 — tested, dtype-dependent, not adopted |
+| 14 | GPU: vectorized byte reads in dequant kernels (Q4_K) | Medium | High | ✅ Done — matmul 1.9×, decode +26%; Q5_K/Q6_K still open |
+| 15 | GPU: f16 intermediate activations | High | Low-Medium (confirmed) | ✅ Done — only ~2-3%, workload wasn't bandwidth-bound yet |
+| 16 | GPU: RMSNorm ran single-threaded | Low | Very High | ✅ Done — 38-45× kernel, decode +65% (biggest win this doc) |
+| 17 | GPU: per-head norms (qk_norm/l2_norm/gdn_norm) 1 thread/head | Low | Medium | ✅ Done — 21× on qk_norm_rope |
+| 18 | GPU: batched-prefill matmul (loop-N / cooperative dequant) | Medium | Dtype-dependent | ❌ Tested — wins Q8_0 (1.5×), regresses Q4_K (0.4×) — not adopted |
+| 19 | GPU: GDN recurrence kernel | N/A | N/A | ✅ Profiled, already well-parallelized — no fix; found ~20% chain pipeline-switch tax instead |
+| 20 | CubeCL `FastMath`/`FastDivmod` micro-opts | Low | None | ❌ Tested, zero measurable effect — reverted |
+| 21 | CMMA / cooperative-matrix hardware | Very High (unbuilt) | Unknown | ✅ Capability confirmed on this GPU (CubeCL `main`); not adopted — Phase 2 candidate |
 
 ---
 
@@ -784,3 +1087,19 @@ cargo run --release --features wgpu --bin compare_backends -- <model.gguf>
 reference; `compare_backends` runs a full forward pass on both CPU and GPU
 backends and compares top-token/top-5 logits. Both were clean (green
 top-token match) after the changes above.
+
+**Priorities 16-20 (2026-07-13 kernel-parallelism work) additionally require:**
+
+```
+GGUF_MODELS_DIR=./models cargo test --release --features wgpu --test golden   # token-parity, all 4 models, CPU+GPU
+cargo run --release --features wgpu --bin drift -- <model.gguf> 256           # 200+ token CPU-f32 vs GPU-f16 drift
+cargo run --release --features wgpu --bin kernel_bench -- <model.gguf>        # per-kernel forced-sync micro-bench
+cargo run --release --features wgpu --bin matmul_batch_bench -- <model.gguf>  # batched/coop matmul probe (Priority 18)
+cargo run --release --features vulkan-poc --bin coop_matrix_probe            # CMMA hardware capability check (Priority 21)
+```
+
+`kernel_bench` is the tool that found Priorities 16/17/19 — always run it
+with the GPU idle and cool (`ps aux | grep llama-server`; check
+`/sys/class/hwmon/hwmon*/temp1_input` < ~55°C) or the numbers are unreliable,
+per the methodology note under "CubeCL Upgrade & Vulkan Library
+Investigation" above.

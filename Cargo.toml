@@ -21,6 +21,11 @@ path = "src/bin/vulkan_poc.rs"
 required-features = ["vulkan-poc"]
 
 [[bin]]
+name = "coop_matrix_probe"
+path = "src/bin/coop_matrix_probe.rs"
+required-features = ["vulkan-poc"]
+
+[[bin]]
 name = "generate_trace"
 path = "src/bin/generate_trace.rs"
 
