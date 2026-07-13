@@ -5,7 +5,8 @@ pub mod kernels_u8;
 pub mod kernels_wgpu;
 
 mod backend_select;
-#[cfg(feature = "wgpu")]
+// Backend-agnostic kernel timing (`GGUF_TRACE_KERNEL=...`) — used by both the
+// CPU and resident-GPU backends, so not gated behind either.
 pub mod trace;
 #[cfg(feature = "cpu")]
 pub mod cpu_backend;
