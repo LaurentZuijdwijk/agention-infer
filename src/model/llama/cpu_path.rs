@@ -134,20 +134,24 @@ impl<'a> LlamaModel<'a> {
 
     /// Naive attention into a caller-provided buffer: computes full attention
     /// scores for all cached positions and writes the attended output for one
-    /// token into `out` (length `n_heads * head_dim`). `scores` is a reused
-    /// scratchpad that must hold at least `k_all.len()` values.
+    /// token into `out` (length `n_heads * head_dim`). `k_all`/`v_all` are
+    /// flat, position-major dequantized KV (`[pos][head_dim_kv]`, from
+    /// `KvCache::read_up_to`). `scores` is a reused scratchpad that must hold
+    /// at least `k_all.len() / head_dim_kv` values.
     fn attention_into(
         &self,
         q: &[f32],
-        k_all: &[Vec<f32>],
-        v_all: &[Vec<f32>],
+        k_all: &[f32],
+        v_all: &[f32],
         out: &mut [f32],
         scores: &mut [f32],
     ) {
         let head_dim = self.cfg.head_dim as usize;
         let n_heads = self.cfg.head_count as usize;
+        let n_kv_heads = self.cfg.head_count_kv as usize;
+        let head_dim_kv = n_kv_heads * head_dim;
         let group_size = self.cfg.gqa_group_size() as usize;
-        let seq_len = k_all.len(); // number of cached positions
+        let seq_len = k_all.len() / head_dim_kv; // number of cached positions, flat/position-major layout
 
         // out is reused across tokens, so clear the region we accumulate into.
         for o in out.iter_mut() {
@@ -162,8 +166,8 @@ impl<'a> LlamaModel<'a> {
             // Attention scores for this head against all cached positions.
             let scores = &mut scores[..seq_len];
             for t in 0..seq_len {
-                let k_start = kv_head * head_dim;
-                let k_head = &k_all[t][k_start..k_start + head_dim];
+                let k_start = t * head_dim_kv + kv_head * head_dim;
+                let k_head = &k_all[k_start..k_start + head_dim];
                 let dot: f32 = q_head.iter().zip(k_head).map(|(a, b)| a * b).sum();
                 scores[t] = dot / (head_dim as f32).sqrt();
             }
@@ -180,8 +184,8 @@ impl<'a> LlamaModel<'a> {
 
             // Weighted sum of V
             for t in 0..seq_len {
-                let v_start = kv_head * head_dim;
-                let v_head = &v_all[t][v_start..v_start + head_dim];
+                let v_start = t * head_dim_kv + kv_head * head_dim;
+                let v_head = &v_all[v_start..v_start + head_dim];
                 for d in 0..head_dim {
                     out[h * head_dim + d] += scores[t] * v_head[d];
                 }

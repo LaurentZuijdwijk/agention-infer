@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use gguf_rs::model::KvDtype;
 use gguf_rs::ops::BackendPreference;
-use gguf_rs::runner::greedy_run;
+use gguf_rs::runner::greedy_run_with_kv_dtype;
 
 #[derive(Parser)]
 #[command(about = "Benchmark prefill/decode throughput vs the bandwidth ceiling")]
@@ -29,6 +30,9 @@ struct Args {
     /// Memory bandwidth of the target box, in GB/s (Strix Halo ≈ 260).
     #[arg(long, default_value_t = 260.0)]
     bandwidth_gbs: f64,
+    /// KV cache storage dtype: f16 (default) or q8_0.
+    #[arg(long, default_value = "f16")]
+    kv_type: String,
 }
 
 fn main() -> Result<()> {
@@ -43,8 +47,11 @@ fn main() -> Result<()> {
         other => anyhow::bail!("unknown backend {other:?} (try cpu | wgpu | metal)"),
     };
 
+    let kv_dtype = KvDtype::parse(&args.kv_type)
+        .ok_or_else(|| anyhow::anyhow!("invalid --kv-type {:?} (expected f16 or q8_0)", args.kv_type))?;
+
     let file_bytes = std::fs::metadata(&args.model)?.len();
-    let r = greedy_run(&args.model, pref, &args.prompt, args.max_tokens, false)?;
+    let r = greedy_run_with_kv_dtype(&args.model, pref, &args.prompt, args.max_tokens, false, kv_dtype)?;
 
     // Bandwidth-bound decode ceiling: one full sweep of the weights per token.
     // For dense models the on-disk size is a good proxy for active bytes/token.

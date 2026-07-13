@@ -43,13 +43,34 @@ impl RunResult {
 
 /// Load `path`, run `prompt` through prefill, then greedily decode up to
 /// `max_new` tokens. `stop_at_eos` halts at the model's EOS token (use `false`
-/// for benchmarking a fixed token count).
+/// for benchmarking a fixed token count). Uses the default KV dtype (f16) —
+/// see [`greedy_run_with_kv_dtype`] to benchmark a specific one.
 pub fn greedy_run(
     path: &Path,
     backend_pref: BackendPreference,
     prompt: &str,
     max_new: usize,
     stop_at_eos: bool,
+) -> Result<RunResult> {
+    greedy_run_with_kv_dtype(
+        path,
+        backend_pref,
+        prompt,
+        max_new,
+        stop_at_eos,
+        crate::model::KvDtype::F16,
+    )
+}
+
+/// Same as [`greedy_run`], with an explicit KV cache dtype — used by `bench`
+/// to compare `--kv-type` options.
+pub fn greedy_run_with_kv_dtype(
+    path: &Path,
+    backend_pref: BackendPreference,
+    prompt: &str,
+    max_new: usize,
+    stop_at_eos: bool,
+    kv_dtype: crate::model::KvDtype,
 ) -> Result<RunResult> {
     let (gguf, mmap) = load(path)?;
     let data = &mmap[gguf.data_offset as usize..];
@@ -68,11 +89,12 @@ pub fn greedy_run(
     }
 
     let max_seq = (prompt_ids.len() + max_new).min(cfg.context_length as usize);
-    let mut kv = KvCache::new(
+    let mut kv = KvCache::new_with_dtype(
         cfg.block_count as usize,
         cfg.head_count_kv as usize,
         cfg.head_dim as usize,
         max_seq,
+        kv_dtype,
     );
 
     // ── Prefill ──────────────────────────────────────────────────────────

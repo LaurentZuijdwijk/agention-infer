@@ -61,6 +61,12 @@ struct Args {
     /// Backend to use (cpu, metal, wgpu). Default: cpu.
     #[arg(long, default_value = "cpu")]
     backend: String,
+
+    /// KV cache storage dtype: f16 (default) or q8_0. llama.cpp `-ctk`/`-ctv`
+    /// parity — q8_0 quarters KV memory/bandwidth vs the original f32 store
+    /// at a small precision cost.
+    #[arg(long, default_value = "f16")]
+    kv_type: String,
 }
 
 /// eprintln that flushes immediately — makes sure tracing shows up in real
@@ -139,12 +145,15 @@ fn main() -> Result<()> {
     }
 
     // ── Set up cache + sampler ──────────────────────────────────────────
+    let kv_dtype = gguf_rs::model::KvDtype::parse(&args.kv_type)
+        .with_context(|| format!("invalid --kv-type {:?} (expected f16 or q8_0)", args.kv_type))?;
     let max_seq = (prompt_ids.len() + args.max_tokens).min(cfg.context_length as usize);
-    let mut kv = KvCache::new(
+    let mut kv = KvCache::new_with_dtype(
         cfg.block_count as usize,
         cfg.head_count_kv as usize,
         cfg.head_dim as usize,
         max_seq,
+        kv_dtype,
     );
 
     let sampling = if args.greedy {

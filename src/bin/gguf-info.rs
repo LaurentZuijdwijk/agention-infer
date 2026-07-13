@@ -262,13 +262,22 @@ fn print_memory_budget(gguf: &GgufFile) -> Result<()> {
             }
         };
 
+        // Exact, block-overhead-aware figures for the two `--kv-type` values
+        // the engine actually supports (f16, q8_0) — not just a flat
+        // bits-per-element estimate.
         let (ctx_16, hit_cap_16) = if available > 0 {
-            cap_ctx(info.max_context_at_kv_bits(available, 16).unwrap_or(0))
+            cap_ctx(
+                info.max_context_at_kv_dtype(available, gguf_rs::model::KvDtype::F16)
+                    .unwrap_or(0),
+            )
         } else {
             (0, false)
         };
         let (ctx_8, hit_cap_8) = if available > 0 {
-            cap_ctx(info.max_context_at_kv_bits(available, 8).unwrap_or(0))
+            cap_ctx(
+                info.max_context_at_kv_dtype(available, gguf_rs::model::KvDtype::Q8_0)
+                    .unwrap_or(0),
+            )
         } else {
             (0, false)
         };

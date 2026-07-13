@@ -130,21 +130,37 @@ impl ModelInfo {
     }
 
     /// KV cache memory per token per layer in bytes (f16 storage).
+    /// See [`Self::kv_bytes_per_token_per_layer_for`] for other KV dtypes.
     pub fn kv_bytes_per_token_per_layer(&self) -> Option<u64> {
+        self.kv_bytes_per_token_per_layer_for(KvDtype::F16)
+    }
+
+    /// KV cache memory per token per layer in bytes, for a given [`KvDtype`]
+    /// — accounts for block/scale overhead (e.g. Q8_0's per-32-element f16
+    /// scale), not just a flat bits-per-element estimate.
+    pub fn kv_bytes_per_token_per_layer_for(&self, dtype: KvDtype) -> Option<u64> {
         let kv = self.effective_head_count_kv()?;
         let hd = self.head_dim()?;
-        Some(2 * kv * hd * 2)
+        let head_dim_kv = (kv * hd) as usize;
+        // K + V, each `dtype.bytes_per_token(head_dim_kv)`.
+        Some(2 * dtype.bytes_per_token(head_dim_kv) as u64)
     }
 
     /// KV cache total bytes for a given context length (f16).
     pub fn kv_cache_bytes(&self, context_len: u64) -> Option<u64> {
-        let per_token = self.kv_bytes_per_token_per_layer()?;
+        self.kv_cache_bytes_for(context_len, KvDtype::F16)
+    }
+
+    /// KV cache total bytes for a given context length and [`KvDtype`].
+    pub fn kv_cache_bytes_for(&self, context_len: u64, dtype: KvDtype) -> Option<u64> {
+        let per_token = self.kv_bytes_per_token_per_layer_for(dtype)?;
         let layers = self.block_count?;
         Some(per_token * layers * context_len)
     }
 
     /// Maximum context length that fits in `available_bytes` of KV cache
-    /// at the given bits-per-element.
+    /// at the given bits-per-element (flat estimate, ignores block overhead
+    /// — see [`Self::max_context_at_kv_dtype`] for an exact, dtype-aware version).
     pub fn max_context_at_kv_bits(&self, available_bytes: u64, bits: u32) -> Option<u64> {
         let kv = self.effective_head_count_kv()?;
         let hd = self.head_dim()?;
@@ -154,6 +170,18 @@ impl ModelInfo {
             return Some(0);
         }
         let total_per_token = bytes_per_token_per_layer * layers;
+        Some(available_bytes / total_per_token)
+    }
+
+    /// Maximum context length that fits in `available_bytes` of KV cache for
+    /// a given [`KvDtype`] — exact, accounts for block/scale overhead.
+    pub fn max_context_at_kv_dtype(&self, available_bytes: u64, dtype: KvDtype) -> Option<u64> {
+        let per_token = self.kv_bytes_per_token_per_layer_for(dtype)?;
+        let layers = self.block_count?;
+        let total_per_token = per_token * layers;
+        if total_per_token == 0 {
+            return Some(0);
+        }
         Some(available_bytes / total_per_token)
     }
 
@@ -498,37 +526,141 @@ pub trait Model: Send + Sync {
     }
 }
 
-/// Simple KV cache using f32 storage.
-/// Phase 5 will replace this with f16/TurboQuant.
+/// KV cache storage dtype — llama.cpp `-ctk`/`-ctv` parity. `F16` (default)
+/// halves memory/bandwidth vs the original f32 store with no block/scale
+/// overhead; `Q8_0` quarters it (GGUF-style block-32, 1 f16 scale + 32 i8 per
+/// block) at a small precision cost. Designed so a future TurboQuant variant
+/// (Phase 6: 3-bit WHT + Lloyd-Max) is just another enum arm in `pack`/
+/// `unpack` below — no restructuring of `KvCache` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDtype {
+    F16,
+    Q8_0,
+}
+
+impl KvDtype {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "f16" => Some(Self::F16),
+            "q8_0" | "q8" => Some(Self::Q8_0),
+            _ => None,
+        }
+    }
+
+    /// Bytes needed to store one token's `head_dim_kv`-length K or V vector.
+    pub fn bytes_per_token(&self, head_dim_kv: usize) -> usize {
+        match self {
+            Self::F16 => head_dim_kv * 2,
+            // GGUF Q8_0 block: 2-byte f16 scale + 32 i8 values = 34 bytes/32 elems.
+            Self::Q8_0 => head_dim_kv.div_ceil(32) * 34,
+        }
+    }
+
+    /// Bits per element — used by the memory-budget calculators in [`ModelInfo`].
+    pub fn bits_per_element(&self) -> u32 {
+        match self {
+            Self::F16 => 16,
+            Self::Q8_0 => 9, // 34 bytes / 32 elems * 8 bits, rounded
+        }
+    }
+
+    fn pack(&self, x: &[f32], out: &mut [u8]) {
+        match self {
+            Self::F16 => {
+                for (v, chunk) in x.iter().zip(out.chunks_exact_mut(2)) {
+                    chunk.copy_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes());
+                }
+            }
+            Self::Q8_0 => {
+                for (block, out_block) in x.chunks(32).zip(out.chunks_mut(34)) {
+                    let amax = block.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                    let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                    out_block[..2].copy_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                    for (v, o) in block.iter().zip(out_block[2..].iter_mut()) {
+                        *o = (*v / scale).round().clamp(-127.0, 127.0) as i8 as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    fn unpack(&self, bytes: &[u8], out: &mut [f32]) {
+        match self {
+            Self::F16 => {
+                for (chunk, v) in bytes.chunks_exact(2).zip(out.iter_mut()) {
+                    *v = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+                }
+            }
+            Self::Q8_0 => {
+                for (in_block, out_block) in bytes.chunks(34).zip(out.chunks_mut(32)) {
+                    let scale = half::f16::from_bits(u16::from_le_bytes([in_block[0], in_block[1]])).to_f32();
+                    for (b, v) in in_block[2..].iter().zip(out_block.iter_mut()) {
+                        *v = (*b as i8) as f32 * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// KV cache. Storage is packed per [`KvDtype`] (`f16` by default); reads
+/// dequantize into internal scratch buffers reused across calls (no
+/// per-token heap allocation), writes quantize in place.
 pub struct KvCache {
-    /// Per-layer K cache: shape [n_layers, max_seq_len, n_kv_heads * head_dim]
-    k: Vec<Vec<Vec<f32>>>,
-    /// Per-layer V cache: shape [n_layers, max_seq_len, n_kv_heads * head_dim]
-    v: Vec<Vec<Vec<f32>>>,
+    dtype: KvDtype,
+    /// Per-layer packed K/V bytes: `[max_seq_len * bytes_per_token]` each.
+    k: Vec<Vec<u8>>,
+    v: Vec<Vec<u8>>,
+    /// Dequantized scratch, reused across `read_up_to` calls: `[max_seq_len *
+    /// head_dim_kv]`, position-major (`[pos][head_dim_kv]`).
+    k_scratch: Vec<f32>,
+    v_scratch: Vec<f32>,
     n_layers: usize,
-    head_dim_kv: usize, // n_kv_heads * head_dim
+    head_dim_kv: usize,
+    max_seq_len: usize,
 }
 
 impl KvCache {
     pub fn new(n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
+        Self::new_with_dtype(n_layers, n_kv_heads, head_dim, max_seq_len, KvDtype::F16)
+    }
+
+    pub fn new_with_dtype(
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: KvDtype,
+    ) -> Self {
         let head_dim_kv = n_kv_heads * head_dim;
-        let k = vec![vec![vec![0.0f32; head_dim_kv]; max_seq_len]; n_layers];
-        let v = vec![vec![vec![0.0f32; head_dim_kv]; max_seq_len]; n_layers];
+        let bytes_per_token = dtype.bytes_per_token(head_dim_kv);
+        let k = vec![vec![0u8; max_seq_len * bytes_per_token]; n_layers];
+        let v = vec![vec![0u8; max_seq_len * bytes_per_token]; n_layers];
         Self {
+            dtype,
             k,
             v,
+            k_scratch: vec![0.0; max_seq_len * head_dim_kv],
+            v_scratch: vec![0.0; max_seq_len * head_dim_kv],
             n_layers,
             head_dim_kv,
+            max_seq_len,
         }
     }
 
-    /// Write K and V for a given layer and position.
+    /// The KV storage dtype this cache was built with.
+    pub fn dtype(&self) -> KvDtype {
+        self.dtype
+    }
+
+    /// Write K and V for a given layer and position (quantizes in place).
     pub fn write(&mut self, layer: usize, pos: usize, k: &[f32], v: &[f32]) {
         debug_assert!(layer < self.n_layers);
         debug_assert_eq!(k.len(), self.head_dim_kv);
         debug_assert_eq!(v.len(), self.head_dim_kv);
-        self.k[layer][pos][..k.len()].copy_from_slice(k);
-        self.v[layer][pos][..v.len()].copy_from_slice(v);
+        let bpt = self.dtype.bytes_per_token(self.head_dim_kv);
+        self.dtype.pack(k, &mut self.k[layer][pos * bpt..(pos + 1) * bpt]);
+        self.dtype.pack(v, &mut self.v[layer][pos * bpt..(pos + 1) * bpt]);
     }
 
     /// Write K and V for a contiguous range of positions starting at
@@ -541,24 +673,37 @@ impl KvCache {
         debug_assert_eq!(k.len(), v.len());
         debug_assert_eq!(k.len() % self.head_dim_kv, 0);
         let n = k.len() / self.head_dim_kv;
-        let stride = self.head_dim_kv;
         for p in 0..n {
-            let src = p * stride..(p + 1) * stride;
-            self.k[layer][pos_start + p][..stride].copy_from_slice(&k[src.clone()]);
-            self.v[layer][pos_start + p][..stride].copy_from_slice(&v[src]);
+            let src = p * self.head_dim_kv..(p + 1) * self.head_dim_kv;
+            self.write(layer, pos_start + p, &k[src.clone()], &v[src]);
         }
     }
 
-    /// Read all K and V up to (and including) `pos` for a given layer.
-    /// Returns slices of shape `[pos+1, head_dim_kv]`.
-    pub fn read_up_to(&self, layer: usize, pos: usize) -> (&[Vec<f32>], &[Vec<f32>]) {
+    /// Read (dequantizing) all K and V up to (and including) `pos` for a
+    /// given layer. Returns flat, position-major slices of shape `[(pos+1) *
+    /// head_dim_kv]` — position `t`'s vector is `[t*head_dim_kv ..
+    /// (t+1)*head_dim_kv]`. Backed by internal scratch reused across calls.
+    pub fn read_up_to(&mut self, layer: usize, pos: usize) -> (&[f32], &[f32]) {
         debug_assert!(layer < self.n_layers);
-        (&self.k[layer][..=pos], &self.v[layer][..=pos])
+        let n = pos + 1;
+        let bpt = self.dtype.bytes_per_token(self.head_dim_kv);
+        let hd = self.head_dim_kv;
+        for p in 0..n {
+            self.dtype.unpack(
+                &self.k[layer][p * bpt..(p + 1) * bpt],
+                &mut self.k_scratch[p * hd..(p + 1) * hd],
+            );
+            self.dtype.unpack(
+                &self.v[layer][p * bpt..(p + 1) * bpt],
+                &mut self.v_scratch[p * hd..(p + 1) * hd],
+            );
+        }
+        (&self.k_scratch[..n * hd], &self.v_scratch[..n * hd])
     }
 
     /// Maximum sequence length this cache was allocated for.
     pub fn max_seq_len(&self) -> usize {
-        self.k.first().map_or(0, |l| l.len())
+        self.max_seq_len
     }
 }
 
