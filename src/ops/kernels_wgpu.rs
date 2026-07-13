@@ -67,7 +67,7 @@ pub fn split_qg(qg_raw: &Array<Act>, q: &mut Array<Act>, gate: &mut Array<Act>, 
     gate[idx] = qg_raw[src + head_dim + d];
 }
 
-// ── RMSNorm: out[i] = (x[i] / rms) * weight[i] ────────────────────────────
+// ── RMSNorm: out[i] = (x[i] / rms) * weight[i] ───────────────────────────
 //
 // Parallel over `RMSNORM_THREADS` lanes in one workgroup: each lane reduces a
 // strided slice of `x` into a partial sum-of-squares, a shared-memory tree
@@ -1263,25 +1263,37 @@ fn partial_q4_k(
 
         let low = is % 2u32 == 0u32;
 
+        // Read the 32 packed quantized bytes one `u32` word at a time (4 bytes per
+        // fetch) instead of a per-byte `read_byte_u32` that re-derives the word
+        // index + shift each time. `qs_byte_off` is 4-aligned (all its terms
+        // are multiples of 4), so `qs_byte_off/4 + l/4` is the exact word index.
+        //
         // `if low { A } else { B }` must select a complete final value here
         // (idx, nibble), not an intermediate scalar (e.g. a 0/4 shift amount)
         // combined with further arithmetic afterward — cubecl's wgpu codegen
         // has been observed to silently always take the `else` branch when a
         // runtime if/else's result feeds into more arithmetic before use.
         // See git history for the synthetic single-block repro that caught this.
+        let qs_word_base = qs_byte_off / 4;
         let mut l = 0usize;
         while l < 32 {
-            let idx = if low {
-                group_val_base as usize + l
-            } else {
-                group_val_base as usize + 32 + l
-            };
-            if idx < in_dim {
-                let qb = read_byte_u32(w, qs_byte_off + l);
-                let nibble = if low { qb & 0xFu32 } else { (qb >> 4u32) & 0xFu32 };
-                sum += (d_sc * (nibble as f32) - dmin_m) * f32::cast_from(x[x_base + idx]);
+            let word = w[qs_word_base + l / 4];
+            let mut bb = 0usize;
+            while bb < 4 {
+                let ll = l + bb;
+                let idx = if low {
+                    group_val_base as usize + ll
+                } else {
+                    group_val_base as usize + 32 + ll
+                };
+                if idx < in_dim {
+                    let qb = (word >> (8u32 * bb as u32)) & 0xFFu32;
+                    let nibble = if low { qb & 0xFu32 } else { (qb >> 4u32) & 0xFu32 };
+                    sum += (d_sc * (nibble as f32) - dmin_m) * f32::cast_from(x[x_base + idx]);
+                }
+                bb += 1;
             }
-            l += 1;
+            l += 4;
         }
         u += 64;
     }

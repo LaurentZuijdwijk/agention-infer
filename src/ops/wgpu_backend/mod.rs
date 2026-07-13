@@ -471,21 +471,40 @@ impl WgpuBackend {
 }
 
 /// Pack raw quantized bytes into u32 words, 4 bytes per word (WGSL has no u8).
+/// Uses rayon parallelism for tensors with many rows (>= 16).
 fn pack_bytes_to_u32(w: &[u8], row_bytes: usize, out_dim: usize, row_u32s: usize) -> Vec<u32> {
     let mut packed = vec![0u32; out_dim * row_u32s];
-    for row_idx in 0..out_dim {
-        // Bounded to exactly this row's bytes — an earlier unbounded slice
-        // here (`&w[row_idx * row_bytes..]`, running to the end of `w`)
-        // made every row repack the entire remaining tensor, i.e. O(rows^2).
-        let row_start = row_idx * row_bytes;
-        let src = &w[row_start..row_start + row_bytes];
-        let dst_base = row_idx * row_u32s;
-        for (i, chunk) in src.chunks(4).enumerate() {
-            let mut word: u32 = 0;
-            for (j, &b) in chunk.iter().enumerate() {
-                word |= (b as u32) << (8 * j);
+    
+    // Parallel packing for tensors with enough rows to amortize overhead
+    if out_dim >= 16 {
+        use rayon::prelude::*;
+        packed
+            .par_chunks_mut(row_u32s)
+            .enumerate()
+            .for_each(|(row_idx, dst)| {
+                let row_start = row_idx * row_bytes;
+                let src = &w[row_start..row_start + row_bytes];
+                for (i, chunk) in src.chunks(4).enumerate() {
+                    let mut word: u32 = 0;
+                    for (j, &b) in chunk.iter().enumerate() {
+                        word |= (b as u32) << (8 * j);
+                    }
+                    dst[i] = word;
+                }
+            });
+    } else {
+        // Sequential for small tensors (low overhead path)
+        for row_idx in 0..out_dim {
+            let row_start = row_idx * row_bytes;
+            let src = &w[row_start..row_start + row_bytes];
+            let dst_base = row_idx * row_u32s;
+            for (i, chunk) in src.chunks(4).enumerate() {
+                let mut word: u32 = 0;
+                for (j, &b) in chunk.iter().enumerate() {
+                    word |= (b as u32) << (8 * j);
+                }
+                packed[dst_base + i] = word;
             }
-            packed[dst_base + i] = word;
         }
     }
     packed
