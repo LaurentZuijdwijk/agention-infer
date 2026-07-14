@@ -580,6 +580,143 @@ pub fn kv_cache_write(
     v_cache[pos * kv_dim + i] = new_v[i];
 }
 
+// ── KV cache write (Q8_0) ─────────────────────────────────────────────────
+//
+// Optional quantized KV storage (`--kv-type q8_0`). GPU-side block layout
+// differs from the CPU `KvDtype::Q8_0` packing (which matches GGUF's tight
+// 34-byte block) — here each block is padded to **36 bytes = 9 u32 words**:
+// word 0 holds the scale as a bit-reinterpreted f32 (cubecl's `Reinterpret`
+// cast requires matching sizes, so a 4-byte f32 word — not a 2-byte f16 —
+// is the natural fit here), words 1..9 each hold 4 consecutive quantized
+// bytes, **offset-binary** (`byte = q + 128`, `q = byte - 128` to reverse),
+// not two's complement — a direct negative-float→int cast (`q as i32 as
+// u32`) measurably returns 0 on this backend instead of the correct bit
+// pattern (caught with `src/bin/kv_q8_debug.rs`), so the whole pipeline
+// avoids ever casting a negative value to an integer type. This keeps every
+// block u32-aligned to every other block (unlike GGUF's packing), so
+// there's never a cross-block partial-word read/write — the exact hazard
+// flagged for Q6_K elsewhere in this file. The two backends never interact
+// directly (each quantizes/dequantizes only its own bytes), so there's no
+// requirement their layouts match.
+//
+// One workgroup per 32-element block, 32 cooperating lanes: each lane holds
+// one element, a shared-memory tree reduction finds the block's max-abs
+// (plain `smem[lane] = max(a, b)` reassignment of fresh locals is fine here —
+// same pattern as `attention_softmax`'s phase-1 max reduction; the
+// self-referential-scalar restriction that needs `RuntimeCell` doesn't apply
+// to writing a freshly-read pair into a `SharedMemory` slot), then every lane
+// quantizes its own value against that shared scale. Quantized bytes are
+// staged through shared memory so groups of 4 lanes can combine into one u32
+// write each, avoiding any read-modify-write race on a shared word.
+
+#[cube(launch)]
+pub fn kv_cache_write_q8_0(
+    k_cache: &mut Array<u32>,
+    v_cache: &mut Array<u32>,
+    new_k: &Array<Act>,
+    new_v: &Array<Act>,
+    pos: usize,
+    kv_dim: usize,
+    words_per_token: usize,
+) {
+    let block = CUBE_POS_X as usize;
+    let lane = UNIT_POS as usize;
+    let elem = block * 32 + lane;
+    let token_word_base = pos * words_per_token + block * 9;
+
+    let mut amax_mem = SharedMemory::<f32>::new(32usize);
+    let mut byte_mem = SharedMemory::<u32>::new(32usize);
+
+    // --- K ---
+    let kv = if elem < kv_dim { f32::cast_from(new_k[elem]) } else { 0.0f32.into() };
+    amax_mem[lane] = f32::abs(kv);
+    sync_cube();
+    let mut stride = 16usize;
+    while stride >= 1 {
+        if lane < stride {
+            let a = amax_mem[lane];
+            let b = amax_mem[lane + stride];
+            amax_mem[lane] = max(a, b);
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let amax_k = amax_mem[0];
+    let scale_k = if amax_k > 0.0f32 { amax_k / 127.0f32 } else { 1.0f32.into() };
+    sync_cube();
+
+    // Offset-binary: bias by +128 before the float→uint cast so the value
+    // is always non-negative. A direct negative-float→int cast measurably
+    // returns 0 on this backend (verified with `src/bin/kv_q8_debug.rs`) —
+    // this sidesteps it entirely rather than depending on it.
+    let q_k = f32::clamp(f32::round(kv / scale_k), -127.0f32, 127.0f32);
+    byte_mem[lane] = (q_k + 128.0f32) as u32;
+    sync_cube();
+    if lane == 0 {
+        k_cache[token_word_base] = u32::reinterpret(scale_k);
+    }
+    if lane < 8 {
+        let b0 = byte_mem[lane * 4];
+        let b1 = byte_mem[lane * 4 + 1];
+        let b2 = byte_mem[lane * 4 + 2];
+        let b3 = byte_mem[lane * 4 + 3];
+        k_cache[token_word_base + 1 + lane] = b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32);
+    }
+    sync_cube();
+
+    // --- V (same steps, reusing the shared memory) ---
+    let vv = if elem < kv_dim { f32::cast_from(new_v[elem]) } else { 0.0f32.into() };
+    amax_mem[lane] = f32::abs(vv);
+    sync_cube();
+    let mut stride2 = 16usize;
+    while stride2 >= 1 {
+        if lane < stride2 {
+            let a = amax_mem[lane];
+            let b = amax_mem[lane + stride2];
+            amax_mem[lane] = max(a, b);
+        }
+        sync_cube();
+        stride2 /= 2;
+    }
+    let amax_v = amax_mem[0];
+    let scale_v = if amax_v > 0.0f32 { amax_v / 127.0f32 } else { 1.0f32.into() };
+    sync_cube();
+
+    let q_v = f32::clamp(f32::round(vv / scale_v), -127.0f32, 127.0f32);
+    byte_mem[lane] = (q_v + 128.0f32) as u32;
+    sync_cube();
+    if lane == 0 {
+        v_cache[token_word_base] = u32::reinterpret(scale_v);
+    }
+    if lane < 8 {
+        let b0 = byte_mem[lane * 4];
+        let b1 = byte_mem[lane * 4 + 1];
+        let b2 = byte_mem[lane * 4 + 2];
+        let b3 = byte_mem[lane * 4 + 3];
+        v_cache[token_word_base + 1 + lane] = b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32);
+    }
+}
+
+/// Dequantize one element of a Q8_0-packed KV vector: `elem` is the index
+/// within the `kv_dim`-length vector, `token_word_base` is the u32 offset of
+/// this token's record (`pos * words_per_token`). See `kv_cache_write_q8_0`
+/// for the block layout (word 0 = bit-reinterpreted f32 scale, words 1..9 =
+/// 32 packed i8 bytes).
+#[cube]
+fn dequant_kv_q8_0(cache: &Array<u32>, token_word_base: usize, elem: usize) -> f32 {
+    let block = elem / 32;
+    let lane = elem % 32;
+    let block_word_base = token_word_base + block * 9;
+    let scale = f32::reinterpret(cache[block_word_base]);
+    let word = cache[block_word_base + 1 + lane / 4];
+    let byte = (word >> (8u32 * (lane % 4) as u32)) & 0xFFu32;
+    // Reverse the +128 offset-binary bias applied at write time (see
+    // `kv_cache_write_q8_0`) — `byte` is always non-negative here so this
+    // avoids the negative-float/int cast that measurably breaks on this
+    // backend.
+    (f32::cast_from(byte) - 128.0f32) * scale
+}
+
 // ── Causal GQA attention ──────────────────────────────────────────────────
 //
 // Split into three kernels, each parallel over a much wider index space than
@@ -755,6 +892,88 @@ pub fn attention_output(
     while t <= pos {
         let v_off = t * kv_dim + kv_base;
         acc += weights[h * max_seq + t] * f32::cast_from(kv_cache_v[v_off + d]);
+        t += 1;
+    }
+    out[h * head_dim + d] = Act::cast_from(acc / sums[h]);
+}
+
+// ── Q8_0 KV variants of the two dot-product attention kernels ────────────
+//
+// Same shapes and math as `attention_scores`/`attention_output` above;
+// only the KV read is different (`dequant_kv_q8_0` per element instead of
+// a direct `Array<Act>` index), so these are separate kernels rather than a
+// runtime branch — the KV array's element type (`u32` packed-Q8_0 vs
+// `Act`) has to be resolved at the type level. `attention_softmax` is
+// dtype-agnostic (it only touches `scores`/`weights`, both always f32) and
+// so is shared unchanged between the f16 and Q8_0 KV paths.
+
+#[cube(launch)]
+pub fn attention_scores_q8_0(
+    q: &Array<Act>,
+    kv_cache_k: &Array<u32>,
+    scores: &mut Array<f32>,
+    pos: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    words_per_token: usize,
+) {
+    let idx = ABSOLUTE_POS;
+    let seq_len = pos + 1;
+    if idx >= n_heads * seq_len {
+        terminate!();
+    }
+    let h = idx / seq_len;
+    let t = idx % seq_len;
+
+    let group = n_heads / n_kv_heads;
+    let kv_head = h / group;
+    let q_base = h * head_dim;
+    let kv_base = kv_head * head_dim;
+    let scale = 1.0f32 / f32::sqrt(head_dim as f32);
+
+    let token_word_base = t * words_per_token;
+    let mut dot = 0.0f32;
+    let mut d = 0usize;
+    while d < head_dim {
+        let kd = dequant_kv_q8_0(kv_cache_k, token_word_base, kv_base + d);
+        dot += f32::cast_from(q[q_base + d]) * kd;
+        d += 1;
+    }
+    scores[h * max_seq + t] = dot * scale;
+}
+
+#[cube(launch)]
+pub fn attention_output_q8_0(
+    kv_cache_v: &Array<u32>,
+    weights: &Array<f32>,
+    sums: &Array<f32>,
+    out: &mut Array<Act>,
+    pos: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    words_per_token: usize,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx >= n_heads * head_dim {
+        terminate!();
+    }
+    let h = idx / head_dim;
+    let d = idx % head_dim;
+
+    let group = n_heads / n_kv_heads;
+    let kv_head = h / group;
+    let kv_base = kv_head * head_dim;
+
+    let mut acc = 0.0f32;
+    let mut t = 0usize;
+    while t <= pos {
+        let token_word_base = t * words_per_token;
+        let vd = dequant_kv_q8_0(kv_cache_v, token_word_base, kv_base + d);
+        acc += weights[h * max_seq + t] * vd;
         t += 1;
     }
     out[h * head_dim + d] = Act::cast_from(acc / sums[h]);

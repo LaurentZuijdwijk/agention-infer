@@ -229,17 +229,21 @@ impl<'a> LlamaModel<'a> {
     }
 
     /// Lazily allocate the GPU-resident KV cache (and shared attention-score
-    /// scratch buffer), sized to `max_seq_len`, for every `Attention` layer
-    /// that doesn't have one yet. Cheap no-op on repeat calls once allocated
-    /// — called once per `forward()` before the resident path can run, since
-    /// `max_seq_len` isn't known until the caller builds its `KvCache`.
+    /// scratch buffer), sized to `max_seq_len` and laid out for `kv_dtype`,
+    /// for every `Attention` layer that doesn't have one yet. Cheap no-op on
+    /// repeat calls once allocated — called once per `forward()` before the
+    /// resident path can run, since `max_seq_len`/`kv_dtype` aren't known
+    /// until the caller builds its `KvCache`. Reallocates (dropping any
+    /// cached KV) if either `max_seq_len` or `kv_dtype` changed since the
+    /// last call.
     #[cfg(feature = "wgpu")]
-    pub(crate) fn ensure_gpu_kv_cache(&mut self, max_seq_len: usize) {
+    pub(crate) fn ensure_gpu_kv_cache(&mut self, max_seq_len: usize, kv_dtype: crate::model::KvDtype) {
         let wgpu = match &self.backend {
             Some(AnyBackend::Wgpu(b)) => b,
             _ => return,
         };
         if self.gpu_kv_max_seq == max_seq_len
+            && self.gpu_kv_dtype == kv_dtype
             && self
                 .layers
                 .iter()
@@ -254,14 +258,26 @@ impl<'a> LlamaModel<'a> {
 
         let n_heads = self.cfg.head_count as usize;
         let kv_dim = self.cfg.head_count_kv as usize * self.cfg.head_dim as usize;
-        let zeros = vec![0.0f32; max_seq_len * kv_dim];
 
         let mut new_kv = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if matches!(layer.mixer, Mixer::Attention { .. } | Mixer::GatedAttention { .. }) {
-                // KV cache stores the `Act` activation type (f16 by default).
-                let hk = wgpu.upload_act(&zeros);
-                let hv = wgpu.upload_act(&zeros);
+                let (hk, hv) = match kv_dtype {
+                    // KV cache stores the `Act` activation type (f16 by default).
+                    crate::model::KvDtype::F16 => {
+                        let zeros = vec![0.0f32; max_seq_len * kv_dim];
+                        (wgpu.upload_act(&zeros), wgpu.upload_act(&zeros))
+                    }
+                    // Packed-u32 Q8_0 blocks (see `kv_cache_write_q8_0`'s
+                    // layout doc) — zero-init isn't load-bearing (every
+                    // position is fully written before it's ever read), just
+                    // needs the right byte capacity.
+                    crate::model::KvDtype::Q8_0 => {
+                        let words_per_token = kv_dim.div_ceil(32) * 9;
+                        let bytes = max_seq_len * words_per_token * 4;
+                        (wgpu.client.empty(bytes), wgpu.client.empty(bytes))
+                    }
+                };
                 new_kv.push((i, hk, hv));
             }
         }
@@ -275,6 +291,7 @@ impl<'a> LlamaModel<'a> {
         self.gpu_attn_scores = Some(scores_handle);
         self.gpu_attn_weights = Some(weights_handle);
         self.gpu_kv_max_seq = max_seq_len;
+        self.gpu_kv_dtype = kv_dtype;
     }
 
     /// Non-cfg version for non-wgpu builds.
@@ -467,22 +484,25 @@ impl<'a> LlamaModel<'a> {
 
                     let k_cache = &self.gpu_kv_cache_k[&i];
                     let v_cache = &self.gpu_kv_cache_v[&i];
-                    b.launch_kv_cache_write(k_cache, v_cache, &k_h, &v_h, pos, kv_dim);
-
                     let scores = self.gpu_attn_scores.as_ref().expect("ensure_gpu_kv_cache called");
                     let weights = self.gpu_attn_weights.as_ref().expect("ensure_gpu_kv_cache called");
-                    let attn_out_handle = b.launch_attention(
-                        &q_h,
-                        k_cache,
-                        v_cache,
-                        scores,
-                        weights,
-                        pos,
-                        head_dim,
-                        n_heads,
-                        n_kv_heads,
-                        self.gpu_kv_max_seq,
-                    );
+                    let attn_out_handle = match self.gpu_kv_dtype {
+                        crate::model::KvDtype::F16 => {
+                            b.launch_kv_cache_write(k_cache, v_cache, &k_h, &v_h, pos, kv_dim);
+                            b.launch_attention(
+                                &q_h, k_cache, v_cache, scores, weights, pos, head_dim, n_heads,
+                                n_kv_heads, self.gpu_kv_max_seq,
+                            )
+                        }
+                        crate::model::KvDtype::Q8_0 => {
+                            let words_per_token = kv_dim.div_ceil(32) * 9;
+                            b.launch_kv_cache_write_q8_0(k_cache, v_cache, &k_h, &v_h, pos, kv_dim, words_per_token);
+                            b.launch_attention_q8_0(
+                                &q_h, k_cache, v_cache, scores, weights, pos, head_dim, n_heads,
+                                n_kv_heads, self.gpu_kv_max_seq, words_per_token,
+                            )
+                        }
+                    };
 
                     b.launch_only(ho, &attn_out_handle)
                 }
@@ -531,22 +551,25 @@ impl<'a> LlamaModel<'a> {
 
                     let k_cache = &self.gpu_kv_cache_k[&i];
                     let v_cache = &self.gpu_kv_cache_v[&i];
-                    b.launch_kv_cache_write(k_cache, v_cache, &k_h, &v_h, pos, kv_dim);
-
                     let scores = self.gpu_attn_scores.as_ref().expect("ensure_gpu_kv_cache called");
                     let weights = self.gpu_attn_weights.as_ref().expect("ensure_gpu_kv_cache called");
-                    let attn_out_handle = b.launch_attention(
-                        &q_h,
-                        k_cache,
-                        v_cache,
-                        scores,
-                        weights,
-                        pos,
-                        head_dim,
-                        n_heads,
-                        n_kv_heads,
-                        self.gpu_kv_max_seq,
-                    );
+                    let attn_out_handle = match self.gpu_kv_dtype {
+                        crate::model::KvDtype::F16 => {
+                            b.launch_kv_cache_write(k_cache, v_cache, &k_h, &v_h, pos, kv_dim);
+                            b.launch_attention(
+                                &q_h, k_cache, v_cache, scores, weights, pos, head_dim, n_heads,
+                                n_kv_heads, self.gpu_kv_max_seq,
+                            )
+                        }
+                        crate::model::KvDtype::Q8_0 => {
+                            let words_per_token = kv_dim.div_ceil(32) * 9;
+                            b.launch_kv_cache_write_q8_0(k_cache, v_cache, &k_h, &v_h, pos, kv_dim, words_per_token);
+                            b.launch_attention_q8_0(
+                                &q_h, k_cache, v_cache, scores, weights, pos, head_dim, n_heads,
+                                n_kv_heads, self.gpu_kv_max_seq, words_per_token,
+                            )
+                        }
+                    };
 
                     let gated_handle =
                         b.launch_sigmoid_mul(&attn_out_handle, &gate_h, n_heads * head_dim);

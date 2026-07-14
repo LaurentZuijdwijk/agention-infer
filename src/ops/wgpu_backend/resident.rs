@@ -472,6 +472,39 @@ impl WgpuBackend {
         }
     }
 
+    /// Q8_0 variant of `launch_kv_cache_write`: `k_cache`/`v_cache` are
+    /// packed-u32 buffers (see `kv_cache_write_q8_0`'s block layout doc),
+    /// one workgroup per 32-element block, 32 lanes cooperating on that
+    /// block's max-abs scale.
+    pub fn launch_kv_cache_write_q8_0(
+        &self,
+        k_cache: &cubecl::server::Handle,
+        v_cache: &cubecl::server::Handle,
+        new_k: &cubecl::server::Handle,
+        new_v: &cubecl::server::Handle,
+        pos: usize,
+        kv_dim: usize,
+        words_per_token: usize,
+    ) {
+        use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_kv_cache_write_q8_0");
+        let n_blocks = (kv_dim as u32 + 31) / 32;
+        unsafe {
+            crate::ops::kernels::wgpu::kv_cache_write_q8_0::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(n_blocks, 1, 1),
+                CubeDim::new_1d(32),
+                ArrayArg::from_raw_parts(k_cache.clone(), pos * words_per_token + words_per_token),
+                ArrayArg::from_raw_parts(v_cache.clone(), pos * words_per_token + words_per_token),
+                ArrayArg::from_raw_parts(new_k.clone(), kv_dim),
+                ArrayArg::from_raw_parts(new_v.clone(), kv_dim),
+                pos,
+                kv_dim,
+                words_per_token,
+            );
+        }
+    }
+
     /// Causal GQA attention against the layer's GPU-resident KV cache.
     /// Returns a fresh `out` handle (`n_heads * head_dim`); `scores` and
     /// `weights` are reused scratch buffers (`n_heads * max_seq` each).
@@ -547,6 +580,86 @@ impl WgpuBackend {
                 n_heads,
                 n_kv_heads,
                 max_seq,
+            );
+        }
+
+        out_handle
+    }
+
+    /// Q8_0 variant of `launch_attention`: `k_cache`/`v_cache` are
+    /// packed-u32 buffers, dequantized per-element inside
+    /// `attention_scores_q8_0`/`attention_output_q8_0`. The softmax pass in
+    /// between is unchanged (it only ever touches f32 `scores`/`weights`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attention_q8_0(
+        &self,
+        q: &cubecl::server::Handle,
+        k_cache: &cubecl::server::Handle,
+        v_cache: &cubecl::server::Handle,
+        scores: &cubecl::server::Handle,
+        weights: &cubecl::server::Handle,
+        pos: usize,
+        head_dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        max_seq: usize,
+        words_per_token: usize,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+        let _timer = crate::ops::trace::Timer::new("launch_attention_q8_0");
+        let out_handle = self.client.empty(n_heads * head_dim * crate::ops::ACT_SIZE);
+        let sums_handle = self.client.empty(n_heads * core::mem::size_of::<f32>());
+        let threads = 64u32;
+
+        let seq_len = pos + 1;
+        let wg_scores = (n_heads as u32 * seq_len as u32 + threads - 1) / threads;
+        unsafe {
+            crate::ops::kernels::wgpu::attention_scores_q8_0::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(wg_scores, 1, 1),
+                CubeDim::new_1d(threads),
+                ArrayArg::from_raw_parts(q.clone(), n_heads * head_dim),
+                ArrayArg::from_raw_parts(k_cache.clone(), max_seq * words_per_token),
+                ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
+                pos,
+                head_dim,
+                n_heads,
+                n_kv_heads,
+                max_seq,
+                words_per_token,
+            );
+        }
+
+        unsafe {
+            crate::ops::kernels::wgpu::attention_softmax::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(n_heads as u32, 1, 1),
+                CubeDim::new_1d(threads),
+                ArrayArg::from_raw_parts(scores.clone(), n_heads * max_seq),
+                ArrayArg::from_raw_parts(weights.clone(), n_heads * max_seq),
+                ArrayArg::from_raw_parts(sums_handle.clone(), n_heads),
+                pos,
+                n_heads,
+                max_seq,
+            );
+        }
+
+        let wg_out = (n_heads as u32 * head_dim as u32 + threads - 1) / threads;
+        unsafe {
+            crate::ops::kernels::wgpu::attention_output_q8_0::launch::<WgpuRuntime>(
+                &self.client,
+                CubeCount::Static(wg_out, 1, 1),
+                CubeDim::new_1d(threads),
+                ArrayArg::from_raw_parts(v_cache.clone(), max_seq * words_per_token),
+                ArrayArg::from_raw_parts(weights.clone(), n_heads * max_seq),
+                ArrayArg::from_raw_parts(sums_handle.clone(), n_heads),
+                ArrayArg::from_raw_parts(out_handle.clone(), n_heads * head_dim),
+                pos,
+                head_dim,
+                n_heads,
+                n_kv_heads,
+                max_seq,
+                words_per_token,
             );
         }
 

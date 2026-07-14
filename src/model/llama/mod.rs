@@ -89,6 +89,11 @@ pub struct LlamaModel<'a> {
     /// `max_seq_len` the GPU KV cache / scores buffer above were sized for.
     #[cfg(feature = "wgpu")]
     gpu_kv_max_seq: usize,
+    /// [`KvDtype`] the GPU KV cache above was allocated for — mirrors the
+    /// caller's `KvCache::dtype()` (`--kv-type`); `ensure_gpu_kv_cache`
+    /// reallocates if this changes.
+    #[cfg(feature = "wgpu")]
+    gpu_kv_dtype: crate::model::KvDtype,
     /// Pre-uploaded conv1d kernel weights per GatedDeltaNet layer index.
     #[cfg(feature = "wgpu")]
     gpu_gdn_conv_weights: std::collections::HashMap<usize, cubecl::server::Handle>,
@@ -310,6 +315,8 @@ impl<'a> LlamaModel<'a> {
             #[cfg(feature = "wgpu")]
             gpu_kv_max_seq: 0,
             #[cfg(feature = "wgpu")]
+            gpu_kv_dtype: crate::model::KvDtype::F16,
+            #[cfg(feature = "wgpu")]
             gpu_gdn_conv_weights: std::collections::HashMap::new(),
             #[cfg(feature = "wgpu")]
             gpu_gdn_conv_history: std::collections::HashMap::new(),
@@ -340,7 +347,7 @@ impl<'a> Model for LlamaModel<'a> {
             // `max_seq_len` isn't known until the caller builds its
             // `KvCache`, so the GPU-resident KV cache is allocated lazily
             // here rather than in `pre_upload_gpu`.
-            self.ensure_gpu_kv_cache(kv_cache.max_seq_len());
+            self.ensure_gpu_kv_cache(kv_cache.max_seq_len(), kv_cache.dtype());
             let b = self
                 .gpu_resident_ready_backend()
                 .expect("checked Some(_) above; backend/model didn't change in between");
@@ -372,7 +379,7 @@ impl<'a> Model for LlamaModel<'a> {
 
         #[cfg(feature = "wgpu")]
         let result = if self.gpu_resident_ready_backend().is_some() {
-            self.ensure_gpu_kv_cache(kv_cache.max_seq_len());
+            self.ensure_gpu_kv_cache(kv_cache.max_seq_len(), kv_cache.dtype());
             let b = self
                 .gpu_resident_ready_backend()
                 .expect("checked Some(_) above; backend/model didn't change in between");
