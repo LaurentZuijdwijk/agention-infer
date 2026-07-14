@@ -1002,6 +1002,54 @@ architecture in this codebase, no hidden bug found.
 
 ---
 
+## Priority 23: Loading — mmap Page Cache Accumulates Toward Full Model Size During GPU Upload ✅ FIXED
+
+**Status:** ✅ Fixed 2026-07-14, prompted by the user's own observation while
+running the model that CPU memory filled before GPU memory. Not a memory-pool
+*misplacement* bug — measured directly (`/sys/class/drm/card1/device/mem_info_
+{vram,gtt}_used` alongside process RSS during a real load) and confirmed GPU
+buffers correctly land in VRAM (device-local), not the slower GTT
+(system-RAM-backed) pool. The real issue was a genuine *transient
+double-buffer*: `pre_upload_gpu`'s per-tensor mmap → CPU pack (`Vec<u32>`) →
+GPU upload pipeline let the mmap'd page cache accumulate toward the *entire*
+file's size by the end of loading (each tensor's temporary packing buffer was
+already correctly bounded and dropped per-tensor — no leak there), so the CPU
+briefly held close to a full copy of the model concurrently with the growing
+VRAM copy.
+
+This matters because this project's own thesis (`00-parity-roadmap.md`)
+targets 90–120GB MoE models on a 128GB box, and this test box specifically
+splits its 128GB as 30GB system RAM + a 96GB VRAM carve-out — a model file
+approaching or exceeding system RAM would risk OOM purely from page-cache
+growth during loading, independent of any Rust-level allocation bug.
+
+**Fix:** process tensors in ascending file-offset order (not layer-
+declaration order), and after each upload, `madvise(MADV_DONTNEED)` the
+newly-consumed, page-aligned prefix of the mmap (`release_mmap_prefix` in
+`gpu_resident.rs`). Safe for a read-only file-backed mapping: any later read
+(e.g. the CPU-orchestrated fallback path, if GPU-resident isn't fully ready)
+transparently re-faults from disk — never wrong, just potentially slower in
+that fallback case. `raw_data`'s own start address isn't page-aligned (it's a
+sub-slice of the mmap starting at the GGUF data offset), so the release-range
+math rounds the start up and the end down to page boundaries on *every* call
+— always safe, self-correcting regardless of prior alignment.
+
+| | before | after |
+|---|---|---|
+| peak CPU RSS during load (Qwen3.5-9B) | ~7.5GB | **~3.0GB**, and *decreasing* as loading progresses (2.9→2.1→0.9→0.3GB) |
+| VRAM usage | ~8GB (unaffected) | ~8GB (unaffected) |
+
+Golden green on all 4 models, CPU + GPU; 200-token drift clean; manual LFM2 +
+Qwen3.5-9B generate runs produce identical output to before.
+
+**Effort:** Low-Medium (careful page-alignment math, but self-contained —
+no API changes outside `gpu_resident.rs`) | **Impact:** High for large-model
+loading specifically — directly addresses an OOM risk on the MoE models this
+project's roadmap targets, not yet reproducible on today's small test models
+but real for tomorrow's big ones.
+
+---
+
 ## CubeCL Upgrade & Vulkan Library Investigation (2026-07-13)
 
 Prompted by "should we look at a different GPU library" after Priority 20's
@@ -1108,6 +1156,7 @@ if quality loss is acceptable for a given use case.
 | 20 | CubeCL `FastMath`/`FastDivmod` micro-opts | Low | None | ❌ Tested, zero measurable effect — reverted |
 | 21 | CMMA / cooperative-matrix hardware | Very High (unbuilt) | Unknown | ✅ Capability confirmed on this GPU (CubeCL `main`); not adopted — Phase 2 candidate |
 | 22 | GPU: `short_conv` (LFM2 mixer) | N/A | N/A | ✅ Profiled, already well-parallelized — no fix needed |
+| 23 | Loading: mmap page cache accumulates during GPU upload | Low-Medium | High (large models) | ✅ Fixed — incremental madvise(DONTNEED), peak RSS 7.5GB→3.0GB |
 
 ---
 
