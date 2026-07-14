@@ -54,6 +54,7 @@ memmap2   = "0.9"
 half      = "2.4"
 bytemuck  = "1.21"
 sysinfo   = "0.33"
+libc      = "0.2"
 
 # GPU compute — one kernel set, all backends
 cubecl    = { version = "0.10", default-features = false, features = ["std", "stdlib"] }

@@ -9,6 +9,59 @@ use crate::ops::AnyBackend;
 use crate::model::llama::Mixer;
 use super::LlamaModel;
 
+/// Advise the kernel that the mmap'd page-cache pages covering `[released_up_to,
+/// new_end)` of `raw_data` are no longer needed (`MADV_DONTNEED`) and can be
+/// dropped immediately, rather than waiting for reclaim under memory
+/// pressure. Safe for a read-only, file-backed mapping: any future read
+/// (e.g. the CPU-orchestrated fallback path, if GPU-resident isn't fully
+/// ready) transparently re-faults the page from disk — slower, never wrong.
+///
+/// `released_up_to` must be the return value of a previous call (or `0`) —
+/// it need NOT be page-aligned itself (`raw_data` is a sub-slice of the mmap
+/// starting at the GGUF data offset, which generally isn't a multiple of the
+/// page size, so `raw_data`'s own start address isn't page-aligned either).
+/// This function rounds the release-start UP and the release-end DOWN to
+/// page boundaries on every call, which is always safe (round-up never
+/// releases not-yet-consumed bytes; round-down never releases bytes past
+/// `new_end`) and self-corrects regardless of prior alignment. Returns the
+/// new `released_up_to` for the next call.
+#[cfg(feature = "wgpu")]
+fn release_mmap_prefix(raw_data: &[u8], released_up_to: usize, new_end: usize) -> usize {
+    if new_end <= released_up_to {
+        return released_up_to;
+    }
+    let page_size = page_size();
+    let base = raw_data.as_ptr() as usize;
+    let from_addr = (base + released_up_to).div_ceil(page_size) * page_size;
+    let to_addr = (base + new_end) / page_size * page_size; // round down
+    if to_addr > from_addr {
+        unsafe {
+            libc::madvise(
+                from_addr as *mut libc::c_void,
+                to_addr - from_addr,
+                libc::MADV_DONTNEED,
+            );
+        }
+        to_addr - base
+    } else {
+        released_up_to
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn page_size() -> usize {
+    use std::sync::OnceLock;
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if sz > 0 {
+            sz as usize
+        } else {
+            4096
+        }
+    })
+}
+
 impl<'a> LlamaModel<'a> {
     /// Pre-upload all GPU-dequantizable weight tensors to GPU.
     /// Called once after model creation, before first forward pass.
@@ -56,25 +109,46 @@ impl<'a> LlamaModel<'a> {
         to_upload.push(self.lm_head.clone());
         to_upload.push(self.token_embd.clone());
 
-        eprintln!("  uploading {} tensors to GPU...", to_upload.len());
+        // Process tensors in ascending file-offset order (not declaration
+        // order) so the mmap'd page-cache prefix can be released
+        // incrementally as we go — see the `madvise` call below. Without
+        // this, loading a model whose file size approaches or exceeds
+        // system RAM (the large MoE models this project targets) would
+        // accumulate the *entire* file's page cache in CPU memory,
+        // concurrently with the growing VRAM copy, risking OOM well before
+        // the model is fully uploaded.
+        let mut to_upload_sorted: Vec<(&String, &crate::types::TensorInfo)> = to_upload
+            .iter()
+            .filter_map(|name| {
+                self.weights
+                    .get(name)
+                    .filter(|t| crate::ops::GPU_DEQUANT_DTYPES.contains(&t.ggml_type))
+                    .map(|t| (name, t))
+            })
+            .collect();
+        to_upload_sorted.sort_by_key(|(_, t)| t.byte_offset);
+
+        eprintln!("  uploading {} tensors to GPU...", to_upload_sorted.len());
         let mut uploaded = 0usize;
-        for name in &to_upload {
-            if let Some(tensor) = self.weights.get(name) {
-                if crate::ops::GPU_DEQUANT_DTYPES.contains(&tensor.ggml_type) {
-                    let t0 = Instant::now();
-                    let tensor_data = &self.raw_data[tensor.byte_offset as usize
-                        ..tensor.byte_offset as usize + tensor.byte_size()];
-                    let in_dim = tensor.dims[0] as usize;
-                    let handle = wgpu.upload_weight(tensor.ggml_type, tensor_data, in_dim);
-                    self.gpu_tensors.insert(name.clone(), handle);
-                    uploaded += 1;
-                    let mb = tensor.byte_size() as f64 / 1048576.0;
-                    eprintln!(
-                        "    [{uploaded}] {name} ({mb:.1} MB) in {:.2}s",
-                        t0.elapsed().as_secs_f32()
-                    );
-                }
-            }
+        // Page-aligned high-water mark of mmap bytes already consumed and
+        // safe to drop from the CPU page cache (see `release_mmap_prefix`).
+        let mut released_up_to = 0usize;
+        for (name, tensor) in &to_upload_sorted {
+            let t0 = Instant::now();
+            let tensor_data = &self.raw_data[tensor.byte_offset as usize
+                ..tensor.byte_offset as usize + tensor.byte_size()];
+            let in_dim = tensor.dims[0] as usize;
+            let handle = wgpu.upload_weight(tensor.ggml_type, tensor_data, in_dim);
+            self.gpu_tensors.insert((*name).clone(), handle);
+            uploaded += 1;
+            let mb = tensor.byte_size() as f64 / 1048576.0;
+            eprintln!(
+                "    [{uploaded}] {name} ({mb:.1} MB) in {:.2}s",
+                t0.elapsed().as_secs_f32()
+            );
+
+            let consumed_end = tensor.byte_offset as usize + tensor.byte_size();
+            released_up_to = release_mmap_prefix(self.raw_data, released_up_to, consumed_end);
         }
         eprintln!("  pre-uploaded {uploaded} GPU tensors");
 
